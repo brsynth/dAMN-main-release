@@ -142,7 +142,7 @@ Violating this ordering will break training and simulation.
 ### 7.1 Environment Setup
 
     conda env create -f environment.yaml
-    conda activate dAMN_env
+    conda activate damn-env
 
 ### 7.2 Running the Model
 
