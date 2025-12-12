@@ -184,8 +184,8 @@ Outputs are saved in:
 
 ## 9. Contributors
 
-- Jean-Loup Faulon (INRAE) — Conceptualization, methodology, core model design  
-- Danilo Dursoniah (INRAE) — Implementation, dataset integration, training pipeline, maintenance
+- Jean-Loup Faulon (INRAE) — Conceptualization, methodology, core model design, implementation, dataset integration, training pipeline  
+- Danilo Dursoniah (INRAE) — Testing and maintenance
 
 ---
 
