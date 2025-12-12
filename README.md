@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17908126.svg)](https://doi.org/10.5281/zenodo.17908126)
+
 # dAMN — Dynamic Artificial Metabolic Network  
 Hybrid Neural Network Framework for Dynamic Flux Balance Analysis (dFBA)
 
