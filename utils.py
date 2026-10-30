@@ -33,10 +33,12 @@ def ReLU(x):
 def r2_growth_curve(
     Pred, Ref,
     OD=True,
+    met_idx=-1,  # column index to evaluate; -1 = last (BIOMASS)
 ):
     """
     Compute R² between predicted and reference growth curves for all experiments.
     Pred, Ref: (N_iter, N_exp, n_times, n_met)
+    met_idx: which metabolite column to use (-1 = BIOMASS, or explicit index)
     Returns: np.array of R² values (length N_exp)
     """
     from sklearn.metrics import r2_score
@@ -44,8 +46,8 @@ def r2_growth_curve(
     N_iter, N_exp, n_times, n_met = Pred.shape
     assert Ref.shape == Pred.shape
 
-    Pred_bio = Pred[..., -1]
-    Ref_bio = Ref[..., -1]
+    Pred_bio = Pred[..., met_idx]
+    Ref_bio = Ref[..., met_idx]
 
     if OD:
         Pred_bio, Ref_bio = concentration_to_logOD(Pred_bio), concentration_to_logOD(Ref_bio)
@@ -55,7 +57,11 @@ def r2_growth_curve(
 
     R2 = []
     for i in range(N_exp):
-        r2 = max(0, r2_score(ref_bio_mean[i], pred_bio_mean[i]))
+        valid = ~np.isnan(ref_bio_mean[i])
+        if np.sum(valid) < 2:
+            R2.append(0.0)
+            continue
+        r2 = max(0, r2_score(ref_bio_mean[i][valid], pred_bio_mean[i][valid]))
         R2.append(r2)
     return np.array(R2)
 
@@ -71,10 +77,12 @@ def r2_growth_curve_single(
 def r2_growth_curve_with_std(
     Pred, Ref,
     OD=True,
+    met_idx=-1,  # column index to evaluate; -1 = last (BIOMASS)
 ):
     """
     Compute R² between predicted and reference growth curves for all experiments.
     Pred, Ref: (N_iter, N_exp, n_times, n_met)
+    met_idx: which metabolite column to use (-1 = BIOMASS, or explicit index)
     Returns: np.array of R² values (length N_exp)
     """
     from sklearn.metrics import r2_score
@@ -82,8 +90,8 @@ def r2_growth_curve_with_std(
     N_iter, N_exp, n_times, n_met = Pred.shape
     assert Ref.shape == Pred.shape
 
-    Pred_bio = Pred[..., -1]
-    Ref_bio = Ref[..., -1]
+    Pred_bio = Pred[..., met_idx]
+    Ref_bio = Ref[..., met_idx]
 
     if OD:
         Pred_bio, Ref_bio = concentration_to_logOD(Pred_bio), concentration_to_logOD(Ref_bio)
@@ -93,12 +101,18 @@ def r2_growth_curve_with_std(
 
     R2, R2dev = [], []
     for i in range(N_exp):
-        r2 = max(0, r2_score(ref_bio_mean[i], pred_bio_mean[i]))
+        # Mask NaN reference values (e.g. TARGET is only sparsely measured)
+        valid = ~np.isnan(ref_bio_mean[i])
+        if np.sum(valid) < 2:
+            R2.append(0.0)
+            R2dev.append(0.0)
+            continue
+        r2 = max(0, r2_score(ref_bio_mean[i][valid], pred_bio_mean[i][valid]))
         R2.append(r2)
         r2dev = []
         for j in range(N_iter): # compute R2 for each model
-            r2 = r2_score(ref_bio_mean[i], Pred_bio[j, i])
-            r2dev.append(r2)
+            r2j = r2_score(ref_bio_mean[i][valid], Pred_bio[j, i][valid])
+            r2dev.append(r2j)
         R2dev.append(np.std(r2dev))
         
     return np.array(R2), np.array(R2dev)

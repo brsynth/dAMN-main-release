@@ -56,6 +56,8 @@ def plot_loss(title, loss, num_epochs, save=''):
 def plot_predicted_reference_growth_curve(
     times, Pred, Ref,
     val_dev=None,
+    met_idx=-1,          # NEW: which metabolite column to plot (default: last = BIOMASS)
+    met_label='BIOMASS', # NEW: label shown on axes and filenames
     OD=True, R2=None, R2dev=None,
     train_time_steps=0,
     experiment_ids=None,
@@ -65,96 +67,135 @@ def plot_predicted_reference_growth_curve(
     R2min=0, R2max=1,
 ):
     """
-    Plot all growth curves (OD or concentration) for multiple experiments/iterations.
-    If train_time_steps is provided, splits the predicted curve at that point
-    and draws a vertical line.
+    Plot predicted vs reference curves for a single metabolite across experiments.
+
+    Parameters
+    ----------
+    met_idx   : column index in the k-dimension to plot (e.g. -1 for BIOMASS, 3 for TARGET)
+    met_label : name shown in axis labels, titles, and saved filenames
+    OD        : if True, convert concentration to log(OD) — only meaningful for BIOMASS
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
     N_iter, N_exp, n_times, n_met = Pred.shape
 
-    Pred_bio = Pred[..., -1]
-    Ref_bio = Ref[..., -1]
+    Pred_met = Pred[..., met_idx]   # (N_iter, N_exp, T)
+    Ref_met  = Ref[...,  met_idx]   # (N_iter, N_exp, T)
 
+    # ── val_dev handling ─────────────────────────────────────────────────────
+    ref_met_std = None
+    if val_dev is not None:
+        val_dev = np.asarray(val_dev)
+        if val_dev.ndim == 2 and val_dev.shape[1] == n_times * n_met:
+            val_dev_3d = val_dev.reshape(N_exp, n_times, n_met)
+            ref_met_std = val_dev_3d[:, :, met_idx]
+        elif val_dev.ndim == 3 and val_dev.shape == (N_exp, n_times, n_met):
+            ref_met_std = val_dev[:, :, met_idx]
+        elif val_dev.ndim == 2 and val_dev.shape == (N_exp, n_times):
+            ref_met_std = val_dev
+        # if shape doesn't match just skip std
+
+    # ── OD conversion ────────────────────────────────────────────────────────
     if OD:
-        Pred_bio, Ref_bio = utils.concentration_to_logOD(Pred_bio), utils.concentration_to_logOD(Ref_bio)
+        Pred_met = utils.concentration_to_logOD(Pred_met)
+        Ref_met  = utils.concentration_to_logOD(Ref_met)
+        if ref_met_std is not None:
+            ref_upper = utils.concentration_to_logOD(
+                np.maximum(Ref[..., met_idx].mean(axis=0) + ref_met_std, 1e-12)
+            )
+            ref_lower = utils.concentration_to_logOD(
+                np.maximum(Ref[..., met_idx].mean(axis=0) - ref_met_std, 1e-12)
+            )
+            ref_bio_std_upper = ref_upper - Ref_met.mean(axis=0)
+            ref_bio_std_lower = Ref_met.mean(axis=0) - ref_lower
         ylabel = "log(OD)"
     else:
-        ylabel = "Concentration (mM)"
+        ylabel = f"{met_label} (mM)"
 
-    pred_bio_mean, ref_bio_mean = np.mean(Pred_bio, axis=0), np.mean(Ref_bio, axis=0)
-    pred_bio_std, ref_bio_std   = np.std(Pred_bio, axis=0), (val_dev if val_dev is not None else np.std(Ref_bio, axis=0))
+    pred_mean = np.mean(Pred_met, axis=0)   # (N_exp, T)
+    ref_mean  = np.mean(Ref_met,  axis=0)   # (N_exp, T)
+    pred_std  = np.std(Pred_met,  axis=0)   # (N_exp, T)
 
+    if ref_met_std is None:
+        ref_met_std = np.std(Ref_met, axis=0)
+
+    # ── Per-experiment plots ──────────────────────────────────────────────────
     for i in range(N_exp):
-        if R2 is not None:
-            if not (R2min <= R2[i] <= R2max):
-                continue
-                
-        exp_label = f"Experiment {experiment_ids[i]}" if experiment_ids is not None else f"Exp {i}"
-        title = f"{exp_label} {train_test_split}"
+        if R2 is not None and not (R2min <= R2[i] <= R2max):
+            continue
+
+        exp_label = (f"Experiment {experiment_ids[i]}"
+                     if experiment_ids is not None else f"Exp {i}")
+        title = f"{exp_label} {met_label} {train_test_split}"
 
         plt.figure(figsize=(8, 6), dpi=300)
         plt.rcParams.update({
-            'font.family': 'serif',
-            'font.size': 16,
-            'axes.labelsize': 18,
-            'axes.titlesize': 18,
-            'legend.fontsize': 14,
-            'xtick.labelsize': 14,
-            'ytick.labelsize': 14,
-            'lines.linewidth': 2,
+            'font.family': 'serif', 'font.size': 16,
+            'axes.labelsize': 18, 'axes.titlesize': 18,
+            'legend.fontsize': 14, 'xtick.labelsize': 14,
+            'ytick.labelsize': 14, 'lines.linewidth': 2,
             'lines.markersize': 6
         })
 
-        # Plot reference
-        plt.plot(times, ref_bio_mean[i], marker='o', linestyle='-', color='black', label='Reference')
+        # Reference
+        plt.plot(times, ref_mean[i], marker='o', linestyle='-',
+                 color='black', label='Reference')
 
-        # Plot prediction: split at train_time_steps if needed
+        # Prediction — split at train_time_steps if forecast mode
         if 0 < train_time_steps < len(times):
-            # Prediction up to forecast boundary
-            plt.plot(times[:train_time_steps+1], pred_bio_mean[i][:train_time_steps+1],
-                     marker='s', linestyle='--', color='darkgreen', label='Prediction')
-            # Forecast region
-            plt.plot(times[train_time_steps:], pred_bio_mean[i][train_time_steps:],
+            plt.plot(times[:train_time_steps + 1],
+                     pred_mean[i][:train_time_steps + 1],
+                     marker='s', linestyle='--', color='darkgreen',
+                     label='Prediction')
+            plt.plot(times[train_time_steps:],
+                     pred_mean[i][train_time_steps:],
                      marker='s', linestyle='--', color='darkgreen')
-            # Connector
             plt.plot(
-                [times[train_time_steps-1], times[train_time_steps]],
-                [pred_bio_mean[i][train_time_steps-1], pred_bio_mean[i][train_time_steps]],
+                [times[train_time_steps - 1], times[train_time_steps]],
+                [pred_mean[i][train_time_steps - 1],
+                 pred_mean[i][train_time_steps]],
                 linestyle='-', color='darkgreen', linewidth=3, alpha=0.6
             )
-            plt.axvline(times[train_time_steps], color='k', 
+            plt.axvline(times[train_time_steps], color='k',
                         linestyle=':', alpha=0.6, label='Forecast Start')
         else:
-            plt.plot(times, pred_bio_mean[i], marker='s', 
+            plt.plot(times, pred_mean[i], marker='s',
                      linestyle='--', color='darkgreen', label='Prediction')
 
-        if ref_bio_std is not None:
-            plt.fill_between(times, ref_bio_mean[i] - ref_bio_std[i], 
-                             ref_bio_mean[i] + ref_bio_std[i], color='black', alpha=0.2)
-        if pred_bio_std is not None:
-            plt.fill_between(times, pred_bio_mean[i] - pred_bio_std[i], 
-                             pred_bio_mean[i] + pred_bio_std[i], color='darkgreen', alpha=0.2)
+        # Uncertainty bands
+        plt.fill_between(
+            times,
+            ref_mean[i] - ref_met_std[i],
+            ref_mean[i] + ref_met_std[i],
+            color='black', alpha=0.2
+        )
+        plt.fill_between(
+            times,
+            pred_mean[i] - pred_std[i],
+            pred_mean[i] + pred_std[i],
+            color='darkgreen', alpha=0.2
+        )
 
         plt.xlabel('Time (h)')
         plt.ylabel(ylabel)
         plt.title(title, pad=20)
-        
-        # ---- Print R2 on plot ----
+
         if R2 is not None:
-            R2text =  f"R²: {R2[i]:.2f}±{R2dev[i]:.2f}" if R2dev is not None else f"R²: {R2[i]:.2f}"
-            plt.text(0.05, 0.95, R2text, transform=plt.gca().transAxes,
-                     fontsize=14, verticalalignment='top', 
+            R2text = (f"R²: {R2[i]:.2f}±{R2dev[i]:.2f}"
+                      if R2dev is not None else f"R²: {R2[i]:.2f}")
+            plt.text(0.05, 0.95, R2text,
+                     transform=plt.gca().transAxes, fontsize=14,
+                     verticalalignment='top',
                      bbox=dict(facecolor='white', alpha=0.5, edgecolor='none'))
-         
+
         plt.grid(True, linestyle='--', alpha=0.6)
-        #plt.legend(frameon=True, loc='best', fancybox=True)
+        plt.legend()
         plt.tight_layout()
 
         if save:
-            title_clean = f"{title.replace(' ', '_').replace('/', '')}"
-            plt.savefig(f'{save}/{title_clean}.png', dpi=300, bbox_inches='tight')
+            fname = f"{title.replace(' ', '_').replace('/', '')}.png"
+            plt.savefig(f'{save}/{fname}', dpi=300, bbox_inches='tight')
         plt.show()
 
 def plot_predicted_biomass_and_substrate(
@@ -260,18 +301,6 @@ def plot_predicted_biomass_and_substrate(
             plt.savefig(f'{save}/{title_clean}.png', dpi=300, bbox_inches='tight')
         plt.show()
 
-    times=times,
-    time_cutoffs=9,   # keep this only if your function signature supports it
-    Ref=Ref,
-    Pred_mean=Pred_mean,
-    Pred_std=Pred_std,
-    metabolite_ids=metabolite_ids,
-    val_ids=val_ids,
-    run_name=run_name,
-    N_models=N_models,
-    R2_mat=R2_mat,
-    save_dir="./figure"
-
 def plot_ensemble_concentrations(
     times=[],
     metabolite_ids=[],
@@ -287,12 +316,13 @@ def plot_ensemble_concentrations(
 ):
     """
     Plot ensemble mean ± std for each metabolite and experiment.
-    IMPORTANT: 
-      - NO subplot grid: each figure has a SINGLE Axes.
-      - Each figure has figsize = (10, 6).
-      - One figure per (experiment, metabolite).
-    """
 
+    Notes
+    -----
+    - One figure per (experiment, metabolite)
+    - val_ids can contain experiment IDs (int-like) or held-out variable names
+      (e.g. ['ac_e'] in measure mode)
+    """
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -307,14 +337,13 @@ def plot_ensemble_concentrations(
         times = times[idx]
         Ref = Ref[:, idx, :]
         Pred_mean = Pred_mean[:, idx, :]
-        Pred_std  = Pred_std[:, idx, :]
-    
+        Pred_std = Pred_std[:, idx, :]
+
     Z, T, k_met = Pred_mean.shape
 
     if val_ids is None:
         val_ids = np.arange(Z)
 
-    # Style to match plot_predicted_biomass_and_substrate
     plt.rcParams.update({
         "font.family": "serif",
         "font.size": 16,
@@ -327,22 +356,29 @@ def plot_ensemble_concentrations(
         "lines.markersize": 6,
     })
 
-    for exp_idx, exp_id in enumerate(val_ids):
+    # Helper: safe printable/savable label
+    def _label(x):
+        return str(x).replace("/", "_").replace(" ", "_")
+
+    for exp_idx in range(Z):
+        # In medium/forecast mode val_ids usually indexes experiments
+        # In measure mode val_ids may contain held-out metabolite names
+        if exp_idx < len(val_ids):
+            exp_id = val_ids[exp_idx]
+        else:
+            exp_id = exp_idx
+
+        exp_label = _label(exp_id)
+
         for j, met in enumerate(metabolite_ids):
-
-            y_ref  = Ref[exp_idx, :, j]
+            y_ref = Ref[exp_idx, :, j]
             y_mean = Pred_mean[exp_idx, :, j]
-            y_std  = Pred_std[exp_idx, :, j]
+            y_std = Pred_std[exp_idx, :, j]
 
-            fig, ax = plt.subplots(figsize=(8, 6), dpi=300) 
+            fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
 
-            # Reference data: dots
             ax.plot(times, y_ref, "o", color="black", label="Ref")
-
-            # Mean prediction: line
             ax.plot(times, y_mean, "-", color="tab:blue", label="Pred mean")
-
-            # Shaded ±1 std
             ax.fill_between(
                 times,
                 y_mean - y_std,
@@ -352,37 +388,34 @@ def plot_ensemble_concentrations(
                 label="±1 std",
             )
 
-            # Title with optional R²
             if R2_mat is not None:
                 r2_val = R2_mat[exp_idx, j]
-                if not np.isnan(r2_val):
-                    title = f"{met} (R²={r2_val:.2f})"
-                else:
-                    title = met
+                title = f"{met} (R²={r2_val:.2f})" if not np.isnan(r2_val) else met
             else:
                 title = met
-            ax.set_title(title)
 
+            ax.set_title(title)
             ax.set_xlabel("Time")
             ax.set_ylabel("Concentration")
             ax.grid(True, linestyle="--", alpha=0.3)
 
-            # Legend
-            # ax.legend(loc="upper right")
-
-            # Global title
             fig.suptitle(
-                f"{run_name} – exp {int(exp_id)} – {met} – ensemble of {N_models} models",
+                f"{run_name} – {exp_label} – {met} – ensemble of {N_models} models",
                 fontsize=18,
             )
 
             fig.tight_layout(rect=[0, 0, 1, 0.93])
+
             if save_dir:
-                fig_path = os.path.join( save_dir, f"{run_name}_exp{int(exp_id)}_{met}_ensemble.png")
+                fig_path = os.path.join(
+                    save_dir,
+                    f"{run_name}_{exp_label}_{met}_ensemble.png"
+                )
                 fig.savefig(fig_path, dpi=300)
+
             plt.show()
             plt.close(fig)
-        
+ 
 def plot_similarity_distribution(title, r2_values, save=''):
     """
     Plot R2 value distribution

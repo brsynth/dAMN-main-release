@@ -21,8 +21,17 @@ class LagNetwork(tf.keras.layers.Layer):
       - t_lag:   lag time (duration of lag phase)
       - r_lag:   stiffness parameter for the sigmoid ramp
     """
-    def __init__(self, input_dim, hidden_layers=[50], dropout_rate=0.2, name='lag_network', **kwargs):
+    def __init__(self, input_dim, hidden_layers=[50], dropout_rate=0.2,
+                 ko_embed_dim=0, name='lag_network', **kwargs):
         super().__init__(name=name, **kwargs)
+        self.ko_embed_dim = ko_embed_dim
+        # Optional KO embedding: maps (batch, n) -> (batch, ko_embed_dim).
+        # Created only when ko_embed_dim > 0; otherwise the network input is
+        # exactly C_pred as before (zero overhead when reaction_KO is None).
+        if ko_embed_dim > 0:
+            self.ko_embed = tf.keras.layers.Dense(
+                ko_embed_dim, activation='relu', name='lag_ko_embed'
+            )
         self.hidden_layers = tf.keras.Sequential([
             tf.keras.layers.Dense(h, activation='relu', name=f'lag_hidden_{i}')
             for i, h in enumerate(hidden_layers)
@@ -30,7 +39,15 @@ class LagNetwork(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout_rate, name='lag_dropout')
         self.out_layer = tf.keras.layers.Dense(2, activation=None, name='lag_output')  # 2 outputs: t_lag and r_lag
 
-    def call(self, x, training=False):
+    def call(self, x, training=False, ko_batch=None):
+        # If a KO embedding is configured and ko_batch is provided, concatenate
+        # the embedded KO vector to the concentration input so the network can
+        # produce different lag parameters for different genetic backgrounds.
+        # When ko_embed_dim == 0 or ko_batch is None the path is identical to
+        # the original: only C_pred enters the network.
+        if self.ko_embed_dim > 0 and ko_batch is not None:
+            ko_emb = self.ko_embed(ko_batch)       # (batch, ko_embed_dim)
+            x = tf.concat([x, ko_emb], axis=-1)   # (batch, k + ko_embed_dim)
         x = self.hidden_layers(x)
         x = self.dropout(x, training=training)
         out = self.out_layer(x)
@@ -43,8 +60,16 @@ class FluxNetwork(tf.keras.layers.Layer):
     """
     Neural network for learning fluxes from concentration
     """
-    def __init__(self, input_dim, output_dim, hidden_layers=[500], dropout_rate=0.2, name='flux_network', **kwargs):
+    def __init__(self, input_dim, output_dim, hidden_layers=[500], dropout_rate=0.2,
+                 ko_embed_dim=0, name='flux_network', **kwargs):
         super().__init__(name=name, **kwargs)
+        self.ko_embed_dim = ko_embed_dim
+        # Optional KO embedding: maps (batch, n) -> (batch, ko_embed_dim).
+        # Created only when ko_embed_dim > 0; zero overhead otherwise.
+        if ko_embed_dim > 0:
+            self.ko_embed = tf.keras.layers.Dense(
+                ko_embed_dim, activation='relu', name='flux_ko_embed'
+            )
         # Use Sequential to ensure Keras tracks all sublayers
         self.hidden_layers = tf.keras.Sequential([
             tf.keras.layers.Dense(
@@ -61,7 +86,12 @@ class FluxNetwork(tf.keras.layers.Layer):
             name='output_dense'
         )
 
-    def call(self, x, training=False):
+    def call(self, x, training=False, ko_batch=None):
+        # Concatenate KO embedding to concentration input when available.
+        # Identical to the original when ko_embed_dim == 0 or ko_batch is None.
+        if self.ko_embed_dim > 0 and ko_batch is not None:
+            ko_emb = self.ko_embed(ko_batch)       # (batch, ko_embed_dim)
+            x = tf.concat([x, ko_emb], axis=-1)   # (batch, k + ko_embed_dim)
         x = self.hidden_layers(x)
         x = self.dropout(x, training=training)
         return self.out_layer(x)
@@ -73,9 +103,13 @@ class MetabolicModel(tf.keras.Model):
     dt_vector: tensor of shape (T,) with time differences (t[i+1]-t[i])
     """
 
-    def __init__(self, times, metabolite_ids, Transport, Stoichiometry, rxn_ids, biomass_rxn_id, 
-        hidden_layers_lag=[0], hidden_layers_flux=[500], dropout_rate=0.2, 
-        loss_weight=[0, 0, 0, 0], loss_decay=[0, 0, 0, 0],
+    def __init__(self, times, metabolite_ids, Transport, Stoichiometry, rxn_ids, biomass_rxn_id,
+        hidden_layers_lag=[0], hidden_layers_flux=[500], dropout_rate=0.2,
+        loss_weight=[0, 0, 0, 0, 0],  # SV, negV, C, dropC, KO
+        loss_decay= [0, 0, 0, 0, 0],  # SV, negV, C, dropC, KO
+        reaction_KO=None,    # (Z, n) binary matrix: 1 = reaction knocked out
+        experiment_ids=None, # ordered list of experiment IDs matching reaction_KO rows
+        ko_embed_dim=0,      # >0: embed KO vector and concat to network inputs
         UB_in=0.0, # UB_in : max allowed consumption per step  (C_pred - C_next)
         UB_out=0.0, # UB_out: max allowed production per step   (C_next - C_pred)
         lag_function='exponential',
@@ -93,8 +127,10 @@ class MetabolicModel(tf.keras.Model):
         dt_vector = np.diff(times).astype(np.float32)
         dt_vector = dt_vector / np.min(dt_vector)
         self.dt_vector = tf.convert_to_tensor(dt_vector, dtype=tf.float32)
-        self.Transport = Transport
-        self.Stoichiometry = Stoichiometry
+        # Store as tf.constant so matmuls in the hot loop never trigger
+        # a numpy→tensor conversion or a host→device copy.
+        self.Transport = tf.constant(Transport, dtype=tf.float32)
+        self.Stoichiometry = tf.constant(Stoichiometry, dtype=tf.float32)
         self.k, self.n = Transport.shape[0], Transport.shape[1]
         self.rxn_ids = rxn_ids
         self.biomass_rxn_id = biomass_rxn_id
@@ -118,12 +154,47 @@ class MetabolicModel(tf.keras.Model):
         self.dropout_rate = dropout_rate
         self.loss_weight = loss_weight
         self.loss_decay = loss_decay
+        # tf.constant vectors (shape (5,)): avoid Python-list indexing inside call().
+        # Index 0=SV, 1=negV, 2=C, 3=dropC, 4=KO.
+        self.loss_weight_tf = tf.constant(loss_weight, dtype=tf.float32)  # shape (5,)
+        self.loss_decay_tf  = tf.constant(loss_decay,  dtype=tf.float32)  # shape (5,)
+        # KO embedding dimension — 0 means disabled (no embedding layer created).
+        self.ko_embed_dim = int(ko_embed_dim)
+        # KO matrix: shape (Z, n), one row per experiment in experiment_ids order.
+        # Stored as tf.constant so gather ops inside call() stay on-device.
+        # None when no KO data is available (loss_ko will be zero).
+        if reaction_KO is not None:
+            self.reaction_KO = tf.constant(reaction_KO, dtype=tf.float32)
+        else:
+            self.reaction_KO = None
+        # experiment_ids[i] is the experiment ID whose KO profile is row i of
+        # reaction_KO.  Used in call() to assemble the per-batch KO tensor.
+        self.experiment_ids = list(experiment_ids) if experiment_ids is not None else []
+        self._exp_id_to_ko_row = {
+            eid: i for i, eid in enumerate(self.experiment_ids)
+        }
         self.train_test_split = train_test_split
         self.x_fold = x_fold
 
         # Index of metabolite (if any) held out from concentration loss.
         # This is set externally (e.g. via data.get_holdout_index_from_split()).
-        self.holdout_index = None
+        # Using a property so the column mask in compute_losses is rebuilt
+        # once when holdout_index is assigned, not on every training step.
+        self._holdout_index = None
+
+        # Boolean mask for extracellular metabolites (suffix '_e').
+        # Pre-computed once here so _next_concentration never rebuilds it.
+        self.ext_mask = tf.constant(
+            [met.endswith('_e') for met in self.metabolite_ids],
+            dtype=tf.bool
+        )
+
+        # Column mask for the holdout metabolite used in compute_losses.
+        # Built here as a tf.constant (shape: k,) so compute_losses never
+        # calls tf.tensor_scatter_nd_update on every step.
+        # Initialised to all-True (no holdout); updated when holdout_index
+        # is set externally via the property setter below.
+        self._holdout_col_mask = tf.ones([self.k], dtype=tf.bool)
 
         # Add lag network: maps initial condition to (t_lag, r_lag)
         if self.hidden_layers_lag[0] > 0:
@@ -131,17 +202,34 @@ class MetabolicModel(tf.keras.Model):
                 self.k,
                 hidden_layers=hidden_layers_lag,
                 dropout_rate=dropout_rate,
+                ko_embed_dim=self.ko_embed_dim,
                 name='lag_network'
             )
 
-        # Initialize FluxNetwork  
+        # Initialize FluxNetwork
         self.flux_net = FluxNetwork(
             self.k,
             self.n,
             hidden_layers_flux,
             dropout_rate,
+            ko_embed_dim=self.ko_embed_dim,
             name='flux_network'
         )      
+
+    @property
+    def holdout_index(self):
+        return self._holdout_index
+
+    @holdout_index.setter
+    def holdout_index(self, idx):
+        self._holdout_index = idx
+        # Rebuild the column mask once so compute_losses can use it directly.
+        if idx is not None:
+            mask = [True] * self.k
+            mask[idx] = False
+            self._holdout_col_mask = tf.constant(mask, dtype=tf.bool)
+        else:
+            self._holdout_col_mask = tf.ones([self.k], dtype=tf.bool)
 
     def printout(self):
         print(f'-----------------------------MetabolicModel-----------------------------')
@@ -163,58 +251,19 @@ class MetabolicModel(tf.keras.Model):
         print(f'Upper bounds for in/out medium metaboilites: {self.UB_in, self.UB_out}')
         print(f'Lag function     : {self.lag_function}')
         print(f'Dropout Rate: {self.dropout_rate}')
-        print(f'Loss weight: {self.loss_weight}')
-        print(f'Loss decay: {self.loss_decay}')
+        print(f'Loss weight [SV, negV, C, dropC, KO]: {self.loss_weight}')
+        print(f'Loss decay  [SV, negV, C, dropC, KO]: {self.loss_decay}')
+        ko_shape = tuple(self.reaction_KO.shape) if self.reaction_KO is not None else None
+        print(f'reaction_KO shape: {ko_shape}')
+        print(f'KO embed dim     : {self.ko_embed_dim}')
         print(f'train_test_split: {getattr(self, "train_test_split", "N/A")}')
-        print(f'train_test_split: {getattr(self, "train_time_steps", "N/A")}')
+        print(f'train_time_steps: {getattr(self, "train_time_steps", "N/A")}')
         print(f'x_fold: {getattr(self, "x_fold", "N/A")}')
         print(f'------------------------------------------------------------------------')
 
-    def debug_concentration_step(self, t, C_pred, C_next, delta_C, v_t, lag_params, rt, verbose):
-        """Prints debug information for concentration updates."""
-        """we print experiment I == verbose-1"""
 
-        if len(self.metabolite_ids) == 0:
-            return
-        I = verbose-1 # expeimrnat to be printed
-        tf.print(f't={t}------------------------------------------------------------------')
-        t_lag = lag_params['t_lag']
-        r_lag = lag_params['r_lag']
-        t_lag = tf.reshape(t_lag, [-1, 1])
-        r_lag = tf.reshape(r_lag, [-1, 1])    
-        print(f"Experiment {I+1}: t_lag = {t_lag[I, 0].numpy():.4f}, r_lag = {r_lag[I, 0].numpy():.4f} r_t={float(rt[I])}")
-
-        # Print non-zero C_pred (for t=0)
-        if float(t) == 0.0 and self.metabolite_ids is not None:
-            nonzero_mask_pred = tf.not_equal(C_pred[I], 0.0)
-            nonzero_indices_pred = tf.where(nonzero_mask_pred)
-            nonzero_values_pred = tf.gather(C_pred[I], nonzero_indices_pred)
-            tf.print("C_pred non-zero (t=0):")
-            for idx, val in zip(tf.reshape(nonzero_indices_pred, [-1]).numpy(), tf.reshape(nonzero_values_pred, [-1]).numpy()):
-                met_name = self.metabolite_ids[idx] if idx < len(self.metabolite_ids) else f"Met{idx}"
-                print(f'  idx={idx}  {met_name} = {val:.2f}')
-
-        # print v_t statistics
-        tf.print(f'v_t stats min: {tf.reduce_min(v_t[I]):.2f} ' \
-                 f'max: {tf.reduce_max(v_t[I]):.2f} ' \
-                 f'mean : {tf.reduce_mean(v_t[I]):.2f} ' \
-                 f'num NaN: {tf.reduce_sum(tf.cast(tf.math.is_nan(v_t[I]), tf.int32))}')
-
-        # Print non-zero delta_C C_next
-        nonzero_mask_next = tf.not_equal(C_next[I], 0.0)
-        nonzero_indices_next = tf.where(nonzero_mask_next)
-        nonzero_values_next = tf.gather(C_next[I], nonzero_indices_next)
-        nonzero_values_delta = tf.gather(delta_C[I], nonzero_indices_next)
-        tf.print("delta_C non-zero:")
-        for idx, val in zip(tf.reshape(nonzero_indices_next, [-1]).numpy(), tf.reshape(nonzero_values_delta, [-1]).numpy()):
-            met_name = self.metabolite_ids[idx] if idx < len(self.metabolite_ids) else f"Met{idx}"
-            print(f'  idx={idx}  {met_name} = {val:.2f}')
-        tf.print("C_next non-zero:")
-        for idx, val in zip(tf.reshape(nonzero_indices_next, [-1]).numpy(), tf.reshape(nonzero_values_next, [-1]).numpy()):
-            met_name = self.metabolite_ids[idx] if idx < len(self.metabolite_ids) else f"Met{idx}"
-            print(f'  idx={idx}  {met_name} = {val:.2f}')
-
-    def _compute_lag_params(self, C_pred, t, training, lag_params=None, verbose=False):
+    def _compute_lag_params(self, C_pred, t, training, lag_params=None, verbose=False,
+                            ko_batch=None):
         """
         Compute r_t_broadcast and lag_params.
         - If hidden_layers_lag[0] <= 0, returns r_t = 1 (no lag).
@@ -233,7 +282,7 @@ class MetabolicModel(tf.keras.Model):
 
         # --- 1. Get or reuse lag parameters from lag_net -----------------
         if lag_params is None:
-            t_lag, r_lag = self.lag_net(C_pred, training=training)
+            t_lag, r_lag = self.lag_net(C_pred, training=training, ko_batch=ko_batch)
             lag_params = dict(t_lag=t_lag, r_lag=r_lag)
         else:
             t_lag = lag_params['t_lag']
@@ -287,7 +336,8 @@ class MetabolicModel(tf.keras.Model):
         r_t_broadcast = r_t  # shape (batch_size, 1)
         return r_t_broadcast, lag_params
     
-    def _next_concentration(self, C_pred, t, training, lag_params=None, verbose=False):
+    def _next_concentration(self, C_pred, t, training, lag_params=None, verbose=False,
+                            ko_batch=None):
         """
         Compute the next concentration vector, including lag-phase, for any time step.
         Enforces non-negativity for extracellular metabolites (*_e).
@@ -295,44 +345,43 @@ class MetabolicModel(tf.keras.Model):
 
         # 1. Compute lag-phase parameters
         r_t, lag_params = self._compute_lag_params(
-            C_pred, t, training, lag_params, verbose=verbose
+            C_pred, t, training, lag_params, verbose=verbose, ko_batch=ko_batch
         )
 
         # 2. Predict fluxes
-        v_t = self.flux_net(C_pred, training=training)
+        v_t = self.flux_net(C_pred, training=training, ko_batch=ko_batch)
 
         # 3. Compute dC/dt = v_t @ Transport^T
         delta_C = tf.matmul(v_t, self.Transport, transpose_b=True)
 
-        # 4. Time-step size (normalized dt)
-        t_idx = int(t) if isinstance(t, (int, np.integer)) else int(t.numpy())
-        dt = self.dt_vector[-1] if t_idx >= self.dt_vector.shape[0] else self.dt_vector[t_idx]
+        # 4. Time-step size (normalized dt).
+        # tf.gather keeps the lookup inside the TF graph, avoiding the
+        # .numpy() call that forced an eager mode exit at every step.
+        # t is always a valid index: call() and predict_timecourse() both
+        # iterate over tf.range(T-1), so t < len(dt_vector) by construction.
+        dt = tf.gather(self.dt_vector, tf.cast(t, tf.int32))
 
         # 5. Next concentration update 
         C_next = C_pred + r_t * delta_C * dt
     
         # 6. no negative concentrations
         if getattr(self, "holdout_index", None) is not None: 
-            ext_mask = tf.constant(
-            [met.endswith("_e") for met in self.metabolite_ids],
-            dtype=tf.bool
-            )
-            # Broadcast mask to batch
-            mask_b = tf.broadcast_to(ext_mask, tf.shape(C_next))
+            # self.ext_mask is pre-computed in __init__ — no rebuild here
+            mask_b = tf.broadcast_to(self.ext_mask, tf.shape(C_next))
             # Apply softplus only to extracellular metabolites
             C_next = tf.where(mask_b, tf.nn.softplus(C_next), C_next)
 
-        # Debug
-        if verbose:
-            self.debug_concentration_step(
-                t, C_pred, C_next, delta_C, v_t, lag_params, r_t, verbose
-            )
-
         return C_next, v_t, lag_params
         
-    def compute_losses(self, v_t, C_pred, C_next, C_ref_next, loss_weight, decay):
+    def compute_losses(self, v_t, C_pred, C_next, C_ref_next, loss_weight, decay,
+                       ko_batch=None):
         """
-        Compute the 4 loss components given the current state.
+        Compute the 5 loss components given the current state.
+
+        ko_batch : tf.Tensor of shape (batch, n) or None
+            Per-experiment binary KO mask for the current mini-batch.
+            When not None, L_ko penalises active flux through knocked-out
+            reactions at every time step (flux regulariser, no NaN masking).
         """
 
         if getattr(self, "holdout_index", None) is not None:
@@ -351,15 +400,8 @@ class MetabolicModel(tf.keras.Model):
         # 3) Concentration Loss (drop holdout metabolite from loss_c)
         mask = ~tf.math.is_nan(C_ref_next)    # NaN mask 
         if idx != -1:  # If we have a holdout metabolite, DROP it from loss_c
-            k = tf.shape(mask)[1]
-            # boolean mask for columns (True = keep, False = drop holdout)
-            col_mask = tf.ones([k], dtype=tf.bool)
-            col_mask = tf.tensor_scatter_nd_update(
-                col_mask,
-                indices=[[idx]],
-                updates=[False]
-            )
-            col_mask = tf.reshape(col_mask, [1, -1])
+            # self._holdout_col_mask is pre-built in __init__ / holdout_index setter
+            col_mask = tf.reshape(self._holdout_col_mask, [1, -1])
             col_mask = tf.broadcast_to(col_mask, tf.shape(mask))
             mask = tf.logical_and(mask, col_mask)
         
@@ -399,8 +441,22 @@ class MetabolicModel(tf.keras.Model):
                 drop_term = tf.zeros_like(c_pred)
 
         loss_drop_c = loss_weight[3] * decay[3] * tf.reduce_mean(drop_term)
-        
-        return loss_s_v, loss_neg_v, loss_c, loss_drop_c
+
+        # 5) KO Loss — penalise positive (active) flux through knocked-out reactions.
+        # Computed at every time step regardless of NaN in C_ref_next because it
+        # is a flux regulariser, not a fit-to-data term.  Zero when ko_batch is
+        # None or when loss_weight[4] == 0.0.
+        # decay[4] = exp(-loss_decay[4] * t), computed in call() alongside
+        # the other four decay factors in the single vectorised tf.exp call.
+        if ko_batch is not None:
+            ko_flux  = tf.nn.relu(v_t) * ko_batch          # (batch, n)
+            loss_ko  = (loss_weight[4]
+                        * decay[4]                          # exp(-loss_decay[4] * t)
+                        * tf.reduce_mean(ko_flux))
+        else:
+            loss_ko = tf.constant(0.0)
+
+        return loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko
         
     def call(self, C_ref_batch, training=False, verbose=False):
         """
@@ -413,33 +469,54 @@ class MetabolicModel(tf.keras.Model):
         C0 = C_ref_batch[:, 0, :]   # shape (batch_size, k)
         lag_params = None
         C_pred = C_ref_batch[:, 0, :]  # shape: (batch_size, k)
-        loss_s_v, loss_neg_v, loss_c, loss_drop_c  = 0.0, 0.0, 0.0, 0.0
+        loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko = 0.0, 0.0, 0.0, 0.0, 0.0
         verbose = False if training else verbose
-        
+
+        # Build the per-batch KO mask once before the loop.
+        # C_ref_batch rows are in training order; self._exp_id_to_ko_row maps
+        # experiment IDs to reaction_KO row indices.  When reaction_KO is None
+        # or no experiment IDs are registered, ko_batch stays None and L_ko = 0.
+        ko_batch = None
+        if self.reaction_KO is not None and len(self._exp_id_to_ko_row) > 0:
+            # batch_exp_ids is set externally on the model before each train_step
+            # via model.current_batch_exp_ids (a Python list of int).
+            batch_exp_ids = getattr(self, 'current_batch_exp_ids', None)
+            if batch_exp_ids is not None:
+                row_indices = [self._exp_id_to_ko_row[eid]
+                               for eid in batch_exp_ids
+                               if eid in self._exp_id_to_ko_row]
+                if len(row_indices) == len(batch_exp_ids):
+                    ko_batch = tf.gather(self.reaction_KO, row_indices)  # (batch, n)
+
         for t in tf.range(T-1):
 
             ttf = tf.cast(t, tf.float32)
 
             C_next, v_t, lag_params = self._next_concentration(
-            C_pred, ttf, training=training, lag_params=lag_params, verbose=verbose
+            C_pred, ttf, training=training, lag_params=lag_params, verbose=verbose,
+            ko_batch=ko_batch
             )
- 
+
             # Reference concentrations for time t+1, shape: (batch_size, k)
             C_ref_next = C_ref_batch[:, t+1, :]
-            
-            # Compute all 4 losses at this step
-            decay = [tf.exp(-self.loss_decay[i] * ttf) for i in range(4)]
-            ls_v, lnv, lc, ldc = self.compute_losses(
-            v_t, C_pred, C_next, C_ref_next,  self.loss_weight, decay
+
+            # Single vectorised tf.exp for all 5 loss terms.
+            # loss_decay_tf and loss_weight_tf both have shape (5,):
+            # indices 0-3 = SV, negV, C, dropC; index 4 = KO.
+            decay = tf.exp(-self.loss_decay_tf * ttf)          # shape (5,)
+            ls_v, lnv, lc, ldc, lko = self.compute_losses(
+            v_t, C_pred, C_next, C_ref_next, self.loss_weight_tf, decay,
+            ko_batch=ko_batch
             )
-            loss_s_v += ls_v
-            loss_neg_v += lnv
-            loss_c += lc
+            loss_s_v    += ls_v
+            loss_neg_v  += lnv
+            loss_c      += lc
             loss_drop_c += ldc
+            loss_ko     += lko
 
             C_pred = C_next
 
-        return loss_s_v, loss_neg_v, loss_c, loss_drop_c
+        return loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko
         
     def save_model(self, model_name='dAMNmodel', verbose=False):
         """
@@ -460,8 +537,8 @@ class MetabolicModel(tf.keras.Model):
         'times': self.times.tolist() if isinstance(self.times, (np.ndarray, list)) else list(self.times),
         'train_time_steps': int(self.train_time_steps),
         'metabolite_ids': list(self.metabolite_ids),
-        'Transport': self.Transport.tolist(),
-        'Stoichiometry': self.Stoichiometry.tolist(),
+        'Transport': self.Transport.numpy().tolist(),
+        'Stoichiometry': self.Stoichiometry.numpy().tolist(),
         'k': int(self.k),
         'n': int(self.n),
         'rxn_ids': self.rxn_ids,
@@ -469,12 +546,16 @@ class MetabolicModel(tf.keras.Model):
         'biomass_flux_index': int(self.biomass_flux_index),
         'hidden_layers_lag': self.hidden_layers_lag,
         'hidden_layers_flux': self.hidden_layers_flux,
+        'ko_embed_dim': self.ko_embed_dim,
         'UB_in': float(getattr(self, "UB_in", 0.0)),
         'UB_out': float(getattr(self, "UB_out", 0.0)),
         'lag_function': self.lag_function,         
         'dropout_rate': float(self.dropout_rate),
-        'loss_weight': self.loss_weight,
-        'loss_decay': self.loss_decay,
+        'loss_weight': self.loss_weight,  # 5 elements: SV, negV, C, dropC, KO
+        'loss_decay':  self.loss_decay,   # 5 elements: SV, negV, C, dropC, KO
+        'reaction_KO': (self.reaction_KO.numpy().tolist()
+                        if self.reaction_KO is not None else None),
+        'experiment_ids': self.experiment_ids,
         'train_test_split': getattr(self, "train_test_split", "medium"),
         'x_fold': getattr(self, "x_fold", 5),
         }
@@ -513,17 +594,24 @@ class MetabolicModel(tf.keras.Model):
         Stoichiometry = np.array(config['Stoichiometry'])
         rxn_ids = config['rxn_ids']
         biomass_rxn_id = config['biomass_rxn_id']
-        hidden_layers_lag = config['hidden_layers_lag']
+        hidden_layers_lag  = config['hidden_layers_lag']
         hidden_layers_flux = config['hidden_layers_flux']
+        ko_embed_dim       = int(config.get('ko_embed_dim', 0))
         dropout_rate = config['dropout_rate']
         loss_weight = config['loss_weight']
         loss_decay = config['loss_decay']
+        # Pad to 5 elements for backward compatibility with old models
+        while len(loss_weight) < 5: loss_weight.append(0)
+        while len(loss_decay)  < 5: loss_decay.append(0)
         train_test_split = config.get('train_test_split', 'medium')
         x_fold = config.get('x_fold', 5)
         UB_in = float(config.get('UB_in', 0.0))
         UB_out = float(config.get('UB_out', 0.0))
-        lag_function = config.get('lag_function', 'exponential')       
-        
+        lag_function    = config.get('lag_function',    'exponential')
+        reaction_KO_raw = config.get('reaction_KO', None)
+        reaction_KO     = np.array(reaction_KO_raw, dtype=np.float32) if reaction_KO_raw is not None else None
+        experiment_ids  = config.get('experiment_ids', [])
+
         # Create a new model instance
         model = cls(
         times=times,
@@ -535,19 +623,23 @@ class MetabolicModel(tf.keras.Model):
         biomass_rxn_id=biomass_rxn_id,
         hidden_layers_lag=hidden_layers_lag,
         hidden_layers_flux=hidden_layers_flux,
+        ko_embed_dim=ko_embed_dim,
         UB_in=UB_in, UB_out=UB_out,
         lag_function=lag_function,
         dropout_rate=dropout_rate,
-        loss_weight = loss_weight,
-        loss_decay = loss_decay,
+        loss_weight=loss_weight,
+        loss_decay=loss_decay,
+        reaction_KO=reaction_KO,
+        experiment_ids=experiment_ids,
         train_test_split=train_test_split,
         x_fold=x_fold,
         verbose=verbose,
         name='metabolic_model'
         )
         
-        # Set concentration hold-out index (if any) based on train_test_split
-        model.holdout_index = data.get_holdout_index_from_split(train_test_split, metabolite_ids)
+        # Set concentration hold-out index (if any) based on train_test_split.
+        # Supports both legacy 'concentration-<id>' and new 'measure-<id>' prefixes.
+        model.holdout_index = _resolve_holdout_index(train_test_split, metabolite_ids)
 
         # Ensure the model is built before loading weights
         dummy_input = tf.constant(
@@ -583,15 +675,19 @@ def reset_model(
         biomass_rxn_id=model.biomass_rxn_id,
         hidden_layers_lag=model.hidden_layers_lag,
         hidden_layers_flux=model.hidden_layers_flux,
+        ko_embed_dim=getattr(model, 'ko_embed_dim', 0),
         dropout_rate=model.dropout_rate,
         loss_weight=model.loss_weight,
         loss_decay=model.loss_decay,
+        reaction_KO=(model.reaction_KO.numpy()
+                     if getattr(model, 'reaction_KO', None) is not None else None),
+        experiment_ids=getattr(model, 'experiment_ids', []),
         train_test_split=model.train_test_split,
         x_fold=model.x_fold,
         train_time_steps=model.train_time_steps,
-        lag_function=getattr(model, "lag_function", 'exponential'), 
-        UB_in=getattr(model, "UB_in", 0.0),
-        UB_out=getattr(model, "UB_out", 0.0),
+        lag_function=getattr(model, 'lag_function', 'exponential'),
+        UB_in=getattr(model, 'UB_in', 0.0),
+        UB_out=getattr(model, 'UB_out', 0.0),
         verbose=verbose
     )
 
@@ -603,6 +699,40 @@ def reset_model(
 
     return new_model
     
+
+###############################################################################
+# HOLDOUT INDEX HELPER
+###############################################################################
+
+def _resolve_holdout_index(train_test_split, metabolite_ids):
+    """
+    Return the metabolite column index to hold out from loss_c, or None.
+
+    Accepts both the legacy 'concentration-<metabolite_id>' prefix and the
+    new 'measure-<metabolite_id>' prefix so that old notebooks and new ones
+    both work with this model file.
+
+    Examples
+    --------
+    'concentration-ac_e'  -> index of 'ac_e' in metabolite_ids
+    'measure-ac_e'        -> index of 'ac_e' in metabolite_ids
+    'medium' / 'forecast' -> None
+    """
+    if not isinstance(train_test_split, str):
+        return None
+    s = train_test_split.lower()
+    for prefix in ('concentration-', 'measure-'):
+        if s.startswith(prefix):
+            met_id = train_test_split[len(prefix):].strip()
+            if met_id in metabolite_ids:
+                return metabolite_ids.index(met_id)
+            else:
+                raise ValueError(
+                    f"Held-out metabolite '{met_id}' from train_test_split="
+                    f"'{train_test_split}' not found in metabolite_ids: {metabolite_ids}"
+                )
+    return None
+
 def create_model_train_val(
     media_file, od_file,
     cobra_model_file,
@@ -616,6 +746,7 @@ def create_model_train_val(
     train_test_split='medium',
     UB_in=0, UB_out=0,
     lag_function='exponential',
+    ko_embed_dim=0,
     verbose=False
     ):
     """
@@ -623,6 +754,8 @@ def create_model_train_val(
       - 'medium': Split by random subsets of media/conditions (current default).
       - 'forecast': Temporal split within each medium, training on the first fraction
                     of time steps, validating (forecasting) on the last.
+      - 'measure-<id>': Hold out one measured metabolite from the concentration
+                    loss (same as old 'concentration-<id>' mode).
 
     Constraints
     ----------
@@ -635,9 +768,11 @@ def create_model_train_val(
         If 'forecast', val_ids will be time indices used for test set.
         If 'medium', val_ids are experiment IDs.
     """
-    # Load and process data 
+    # Load and process data.
+    # reaction_KO is a (Z, n) binary matrix from data.process_data; rows are in
+    # exp_ids order and are passed into MetabolicModel for the KO loss term.
     times, metabolite_ids, experiment_data, dev_data, \
-    Stoichiometry, Transport, rxn_ids = data.process_data(
+    Stoichiometry, reaction_KO, Transport, rxn_ids = data.process_data(
         media_file, od_file, cobra_model_file, biomass_rxn_id, verbose=verbose
     )
     exp_ids = list(experiment_data.keys())
@@ -658,10 +793,6 @@ def create_model_train_val(
             f"You currently have T = {total_time_steps}."
         )
 
-    # dev_data as array (may be empty dict, so guard)
-    dev_values = list(dev_data.values())
-    dev_data_arr = np.asarray(dev_values) if len(dev_values) > 0 else None
-    
     base_split = train_test_split if train_test_split in ('medium', 'forecast') else 'forecast'
 
     if base_split == 'medium':  # Splitting by media
@@ -670,34 +801,34 @@ def create_model_train_val(
         train_time_steps = total_time_steps
         train_ids = exp_ids[:split]
         train_data = {eid: experiment_data[eid] for eid in train_ids}
+        train_dev_data = {eid: dev_data[eid] for eid in train_ids}
         train_array = data.prepare_experiment_array(total_time_steps, metabolite_ids, train_data)
-        dev_data_arr = np.asarray(list(dev_data.values()))
-        train_dev = dev_data_arr[:split]
+        # Use prepare_experiment_array for dev data so it is 2D (Z, T*k),
+        # consistent with train_array/val_array and compatible with np.savetxt.
+        train_dev = data.prepare_experiment_array(total_time_steps, metabolite_ids, train_dev_data)
         if x_fold > 1:
             val_ids = exp_ids[split:]
             val_data = {eid: experiment_data[eid] for eid in val_ids}
+            val_dev_data = {eid: dev_data[eid] for eid in val_ids}
             val_array = data.prepare_experiment_array(total_time_steps, metabolite_ids, val_data)
-            val_dev = dev_data_arr[split:]
+            val_dev = data.prepare_experiment_array(total_time_steps, metabolite_ids, val_dev_data)
         else:
             val_array, val_dev, val_ids = train_array, train_dev, train_ids
     elif base_split == 'forecast':
-        # Time-based splitting (forecast-style). For concentration-holdout modes
-        # (train_test_split starting with 'concentration-'), we override this
+        # Time-based splitting (forecast-style). For measure-holdout modes
+        # (train_test_split starting with 'measure-'), we override this
         # and use the FULL time-series for training (no temporal hold-out).
-        if isinstance(train_test_split, str) and train_test_split.lower().startswith('concentration-'):
+        if isinstance(train_test_split, str) and train_test_split.lower().startswith('measure-'):
             # Concentration mode: no time-based split, train on all time points.
             train_time_steps = total_time_steps
             train_ids = exp_ids
             train_data = {eid: experiment_data[eid] for eid in train_ids}
             train_array = data.prepare_experiment_array(total_time_steps, metabolite_ids, train_data)
 
-            # dev_data_arr already computed above (may be None)
-            if dev_data_arr is not None:
-                train_dev = dev_data_arr[:, :train_time_steps]
-            else:
-                train_dev = None
-            # In concentration mode, validation is identical to training w.r.t. time axis.
-            # (When there is only one experiment, this is effectively train==val.)
+            # Build dev array with prepare_experiment_array -> 2D (Z, T*k).
+            train_dev = data.prepare_experiment_array(total_time_steps, metabolite_ids,
+                                                      {eid: dev_data[eid] for eid in train_ids})
+            # In measure- mode, validation is identical to training (same object).
             val_array, val_dev, val_ids = train_array, train_dev, train_ids
         else:
             # Standard forecast mode: use the first fraction of time points for training,
@@ -706,37 +837,44 @@ def create_model_train_val(
             train_ids = exp_ids
             train_data = {eid: experiment_data[eid] for eid in train_ids}
             train_array = data.prepare_experiment_array(train_time_steps, metabolite_ids, train_data)
-            dev_data_arr = np.asarray(list(dev_data.values()))
-            train_dev = dev_data_arr[:, :train_time_steps]
+            train_dev = data.prepare_experiment_array(train_time_steps, metabolite_ids,
+                                                      {eid: dev_data[eid] for eid in train_ids})
             if x_fold > 1:
                 val_ids = train_ids
                 val_array = data.prepare_experiment_array(total_time_steps, metabolite_ids, train_data)
-                val_dev = dev_data_arr
+                val_dev = data.prepare_experiment_array(total_time_steps, metabolite_ids,
+                                                        {eid: dev_data[eid] for eid in train_ids})
             else:
                 val_array, val_dev, val_ids = train_array, train_dev, train_ids
 
     else:
         raise ValueError(f"Unknown base_split value: {base_split}")
-        
-    # Instantiate the model 
+
+    # Instantiate the model
+    # reaction_KO rows correspond to exp_ids in the order returned by
+    # data.process_data (same order as experiment_data.keys()).
     model = MetabolicModel(
-        times, 
+        times,
         metabolite_ids,
-        Transport, Stoichiometry, rxn_ids, biomass_rxn_id, 
-        hidden_layers_lag=hidden_layers_lag, 
-        hidden_layers_flux=hidden_layers_flux, 
-        dropout_rate=dropout_rate, 
-        loss_weight=loss_weight, 
+        Transport, Stoichiometry, rxn_ids, biomass_rxn_id,
+        hidden_layers_lag=hidden_layers_lag,
+        hidden_layers_flux=hidden_layers_flux,
+        ko_embed_dim=ko_embed_dim,
+        dropout_rate=dropout_rate,
+        loss_weight=loss_weight,
         loss_decay=loss_decay,
-        train_test_split=train_test_split, 
+        reaction_KO=reaction_KO,
+        experiment_ids=exp_ids,
+        train_test_split=train_test_split,
         x_fold=x_fold,
         train_time_steps=train_time_steps,
         UB_in=UB_in, UB_out=UB_out,
         lag_function=lag_function,
         verbose=verbose
     )
-    # Set concentration hold-out index (if any) based on train_test_split
-    model.holdout_index = data.get_holdout_index_from_split(train_test_split, metabolite_ids)
+    # Set concentration hold-out index (if any) based on train_test_split.
+    # Supports both legacy 'concentration-<id>' and new 'measure-<id>' prefixes.
+    model.holdout_index = _resolve_holdout_index(train_test_split, metabolite_ids)
     
     if verbose:
         print(f'Train shape: {train_array.shape}')
@@ -748,13 +886,16 @@ def create_model_train_val(
         
     return model, train_array, train_dev, val_array, val_dev, val_ids
 
-def train_step(model, C_ref_batch, optimizer, verbose=False):
+def train_step(model, C_ref_batch, optimizer, verbose=False, batch_exp_ids=None):
+    # Make the batch experiment IDs available to call() so it can assemble ko_batch.
+    model.current_batch_exp_ids = batch_exp_ids
     with tf.GradientTape() as tape:
-        loss_s_v, loss_neg_v, loss_c, loss_drop_c = model(C_ref_batch, training=True, verbose=verbose)
-        loss = loss_s_v + loss_neg_v + loss_c + loss_drop_c  
+        loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko = model(C_ref_batch, training=True, verbose=verbose)
+        loss = loss_s_v + loss_neg_v + loss_c + loss_drop_c + loss_ko
     gradients = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    return loss_s_v, loss_neg_v, loss_c, loss_drop_c
+    model.current_batch_exp_ids = None  # clear after step
+    return loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko
 
 def train_model(
     model, 
@@ -831,8 +972,8 @@ def train_model(
     # === END SANITY CHECK ===
 
     # Track losses
-    losses_s_v_train, losses_neg_v_train, losses_c_train, losses_drop_c_train = [], [], [], []
-    losses_s_v_val, losses_neg_v_val, losses_c_val, losses_drop_c_val = [], [], [], []
+    losses_s_v_train, losses_neg_v_train, losses_c_train, losses_drop_c_train, losses_ko_train = [], [], [], [], []
+    losses_s_v_val, losses_neg_v_val, losses_c_val, losses_drop_c_val, losses_ko_val = [], [], [], [], []
 
     best_val_loss = np.inf
     best_weights = None
@@ -845,47 +986,57 @@ def train_model(
         C_train_all = C_train_all[idxs]
 
         # Per-epoch sums
-        epoch_loss_s_v, epoch_loss_neg_v, epoch_loss_c, epoch_loss_drop_c = 0.0, 0.0, 0.0, 0.0
+        epoch_loss_s_v, epoch_loss_neg_v, epoch_loss_c, epoch_loss_drop_c, epoch_loss_ko = 0.0, 0.0, 0.0, 0.0, 0.0
         for b in range(n_batches):
             start = b * batch_size
             end = min(start + batch_size, Z)
             C_batch = C_train_all[start:end]
-            # Pass the flag and x_fold to train_step
-            loss_s_v, loss_neg_v, loss_c, loss_drop_c = train_step(
-                model, C_batch, optimizer, verbose=verbose
+            # Resolve experiment IDs for this batch so train_step can pass them
+            # to model.call() for KO mask assembly.
+            # model.experiment_ids holds the full ordered list; idxs tracks the
+            # per-epoch shuffle, so idxs[start:end] gives the correct row indices.
+            exp_ids = getattr(model, 'experiment_ids', [])
+            batch_ids = [exp_ids[i] for i in idxs[start:end]] if exp_ids else None
+            loss_s_v, loss_neg_v, loss_c, loss_drop_c, loss_ko = train_step(
+                model, C_batch, optimizer, verbose=verbose, batch_exp_ids=batch_ids
             )
-            epoch_loss_s_v += loss_s_v.numpy()
-            epoch_loss_neg_v += loss_neg_v.numpy()
-            epoch_loss_c += loss_c.numpy()
+            epoch_loss_s_v    += loss_s_v.numpy()
+            epoch_loss_neg_v  += loss_neg_v.numpy()
+            epoch_loss_c      += loss_c.numpy()
             epoch_loss_drop_c += loss_drop_c.numpy()
+            epoch_loss_ko     += loss_ko.numpy()
 
         # Average over batches
-        epoch_loss_s_v /= n_batches
-        epoch_loss_neg_v /= n_batches
-        epoch_loss_c /= n_batches
+        epoch_loss_s_v    /= n_batches
+        epoch_loss_neg_v  /= n_batches
+        epoch_loss_c      /= n_batches
         epoch_loss_drop_c /= n_batches
+        epoch_loss_ko     /= n_batches
 
         losses_s_v_train.append(epoch_loss_s_v)
         losses_neg_v_train.append(epoch_loss_neg_v)
         losses_c_train.append(epoch_loss_c)
         losses_drop_c_train.append(epoch_loss_drop_c)
+        losses_ko_train.append(epoch_loss_ko)
 
         if C_val_all is not None:
-            val_s_v, val_neg_v, val_c, val_drop_c = model(C_val_all, training=False)
-            val_s_v_np = val_s_v.numpy()
-            val_neg_v_np = val_neg_v.numpy()
-            val_c_np = val_c.numpy()
+            val_s_v, val_neg_v, val_c, val_drop_c, val_ko = model(C_val_all, training=False)
+            val_s_v_np    = val_s_v.numpy()
+            val_neg_v_np  = val_neg_v.numpy()
+            val_c_np      = val_c.numpy()
             val_drop_c_np = val_drop_c.numpy()
+            val_ko_np     = val_ko.numpy()
             losses_s_v_val.append(val_s_v_np)
             losses_neg_v_val.append(val_neg_v_np)
             losses_c_val.append(val_c_np)
             losses_drop_c_val.append(val_drop_c_np)
+            losses_ko_val.append(val_ko_np)
 
-            val_loss = val_s_v_np + val_neg_v_np + val_c_np + val_drop_c_np
+            val_loss = val_s_v_np + val_neg_v_np + val_c_np + val_drop_c_np + val_ko_np
             if verbose:
                 print(f'[Epoch {epoch+1}/{num_epochs}] '
-                  f'Train: s_v={epoch_loss_s_v:.1e}, neg_v={epoch_loss_neg_v:.1e}, c={epoch_loss_c:.1e}, drop_c={epoch_loss_drop_c:.1e} | '
-                  f'Val: s_v={val_s_v_np:.1e}, neg_v={val_neg_v_np:.1e}, c={val_c_np:.1e}, drop_c={val_drop_c_np:.1e}')
+                  f'Train: s_v={epoch_loss_s_v:.1e}, neg_v={epoch_loss_neg_v:.1e}, c={epoch_loss_c:.1e}, drop_c={epoch_loss_drop_c:.1e}, ko={epoch_loss_ko:.1e} | '
+                  f'Val: s_v={val_s_v_np:.1e}, neg_v={val_neg_v_np:.1e}, c={val_c_np:.1e}, drop_c={val_drop_c_np:.1e}, ko={val_ko_np:.1e}')
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_weights = model.get_weights()
@@ -900,11 +1051,11 @@ def train_model(
         else:
             if verbose:
                 print(f'[Epoch {epoch+1}/{num_epochs}] '
-                  f'Train: s_v={epoch_loss_s_v:.1e}, neg_v={epoch_loss_neg_v:.1e}, c={epoch_loss_c:.1e}, drop_c={epoch_loss_drop_c:.1e}')
+                  f'Train: s_v={epoch_loss_s_v:.1e}, neg_v={epoch_loss_neg_v:.1e}, c={epoch_loss_c:.1e}, drop_c={epoch_loss_drop_c:.1e}, ko={epoch_loss_ko:.1e}')
 
     return (
-        (losses_s_v_train, losses_neg_v_train, losses_c_train, losses_drop_c_train),
-        (losses_s_v_val, losses_neg_v_val, losses_c_val, losses_drop_c_val)
+        (losses_s_v_train, losses_neg_v_train, losses_c_train, losses_drop_c_train, losses_ko_train),
+        (losses_s_v_val,   losses_neg_v_val,   losses_c_val,   losses_drop_c_val,   losses_ko_val)
     )
 
 ###############################################################################

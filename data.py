@@ -1,103 +1,81 @@
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Set
 import numpy as np
-import tensorflow as tf
 import pandas as pd
 import cobra
-import json
-import matplotlib.pyplot as plt
-import sklearn
 import utils
 
 ###############################################################################
-# PROCESS DATA: MEDIA, OD, AND COBRA MODEL
+# Split media and KO columns
 ###############################################################################
 
-def parse_training_mode(mode_str, default_split="forecast", verbose=True):
-    """Normalize a high-level training *mode* string into the internal
-    `train_test_split` value.
-
-    Parameters
-    ----------
-    mode_str : str
-        User-facing mode string. Typical examples:
-            - 'medium'
-            - 'forecast'
-            - 'concentration-GLC'
-            - 'concentration-ACE'
-            - 'concentration-BIOMASS'
-            - 'concentration-' + full metabolite id
-    default_split : {'forecast', 'medium'}, optional
-        Fallback value if the mode string is not recognized. Defaults to 'forecast'.
-    verbose : bool, optional
-        If True, prints how the mode was interpreted.
-
-    Returns
-    -------
-    train_test_split : str
-        The value that should be passed around internally.
+def validate_measured_ids(
+    cobra_model_file: str,
+    measured_ids: List[str],
+    verbose: bool = False
+):
     """
-    mode_str = str(mode_str).strip()
+    Ensure measured variables are present in the SBML model, except BIOMASS.
 
-    # Simple cases
-    if mode_str in ("forecast", "medium"):
-        if verbose:
-            print(f"[parse_training_mode] mode='{mode_str}' -> train_test_split='{mode_str}'")
-        return mode_str
+    BIOMASS is allowed even though it is not a COBRA metabolite ID.
+    """
+    model = cobra.io.read_sbml_model(cobra_model_file)
+    model_met_ids = {met.id for met in model.metabolites}
 
-    # Concentration hold-out modes stay as-is; MetabolicModel will interpret the
-    # 'concentration-*' pattern.
-    if mode_str.lower().startswith("concentration-"):
-        if verbose:
-            print(f"[parse_training_mode] mode='{mode_str}' kept as concentration mode.")
-        return mode_str
+    missing = [
+        mid for mid in measured_ids
+        if mid != "BIOMASS" and mid not in model_met_ids
+    ]
 
-    # Fallback
     if verbose:
-        print(
-            f"[parse_training_mode] Warning: unrecognized mode '{mode_str}'. "
-            f"Falling back to default_split='{default_split}'."
-        )
-    return default_split
+        print(f"[validate_measured_ids] measured_ids = {measured_ids}")
+        print(f"[validate_measured_ids] missing in model = {missing}")
 
-def get_holdout_index_from_split(train_test_split: str, metabolite_ids: List[str]):
-    """Return index of the metabolite held out from concentration loss.
-    This interprets train_test_split strings of the form 'concentration-XXX'.
-    For example:
-        'concentration-GLC'      -> metabolite 'glc__D_e' (if present)
-        'concentration-ACE'      -> metabolite 'ac_e'
-        'concentration-BIOMASS'  -> metabolite 'BIOMASS'
-
-    If train_test_split does not encode a concentration hold-out, returns None.
-    """
-    if train_test_split is None:
-        return None
-
-    tts = str(train_test_split).strip()
-    if not tts.lower().startswith("concentration-"):
-        return None
-
-    # Suffix after 'concentration-'
-    suffix = tts.split("-", 1)[1].strip()
-
-    # Map short names to canonical metabolite IDs used in the COBRA model
-    short_to_full = {
-        "GLC": "glc__D_e",
-        "ACE": "ac_e",
-        "BIOMASS": "BIOMASS",
-    }
-    metabolite_id = short_to_full.get(suffix.upper(), suffix)
-
-    try:
-        return metabolite_ids.index(metabolite_id)
-    except ValueError:
+    if missing:
         raise ValueError(
-            f"Concentration split requested for '{metabolite_id}', "
-            f"but this metabolite is not in metabolite_ids: {metabolite_ids}"
+            "The following measured variables are not present as metabolite IDs "
+            f"in the SBML model: {missing}\n"
+            "BIOMASS is the only allowed exception."
         )
-        
+
+def split_media_and_ko_columns(media_df: pd.DataFrame):
+    """
+    Split a media+KO dataframe into:
+      - media-only dataframe (ID + media columns)
+      - list of media metabolite column names
+      - list of KO column names
+
+    KO columns start at the first header that begins with 'KO_'.
+    """
+    cols = list(media_df.columns)
+
+    if "ID" not in cols:
+        raise ValueError("media_file must contain an 'ID' column.")
+
+    ko_start_idx = None
+    for i, c in enumerate(cols):
+        if str(c).startswith("KO_"):
+            ko_start_idx = i
+            break
+
+    if ko_start_idx is None:
+        media_cols = cols
+        ko_cols = []
+    else:
+        media_cols = cols[:ko_start_idx]
+        ko_cols = cols[ko_start_idx:]
+
+    media_only_df = media_df[media_cols].copy()
+    media_metabolite_ids = media_cols[1:]  # skip ID
+
+    return media_only_df, media_metabolite_ids, ko_cols
+    
+################################################################################
+#  Get Stoichiometry, Transport and KO matrices
+###############################################################################
+
 def build_Stoichiometry_and_Transport_from_cobra(
-    cobra_model_file: str, 
-    medium_met_ids: List[str], 
+    cobra_model_file: str,
+    medium_met_ids: List[str],
     biomass_rxn_id: str,
     verbose=False
 ) -> Tuple[np.ndarray, np.ndarray, int, int, List[str]]:
@@ -105,262 +83,376 @@ def build_Stoichiometry_and_Transport_from_cobra(
     Build stoichiometric and Transport matrices from a COBRA model.
 
     medium_met_ids:
-        List of external/metabolite IDs you want as "state variables" in the
-        model (e.g. ['glc__D_e', 'ac_e', 'BIOMASS']).
+        List of external/metabolite IDs used as state variables
+        (e.g. ['glc__D_e', 'ac_e', 'BIOMASS']).
     """
+
     model = cobra.io.read_sbml_model(cobra_model_file)
-    
-    # Get reaction and metabolite IDs (strings)
+
     rxn_ids = [rxn.id for rxn in model.reactions]
     full_met_ids = [met.id for met in model.metabolites]
 
     m = len(full_met_ids)
     n = len(rxn_ids)
 
-    # Build stoichiometric matrix
+    met_id_to_idx = {met_id: i for i, met_id in enumerate(full_met_ids)}
+
     Stoichiometry = np.zeros((m, n), dtype=np.float32)
     for j, rxn in enumerate(model.reactions):
         for met, coeff in rxn.metabolites.items():
-            i = full_met_ids.index(met.id)
+            i = met_id_to_idx[met.id]
             Stoichiometry[i, j] = coeff
-            
-    # Build Transport matrix (rows = medium_met_ids, cols = reactions)
+
     Transport = np.zeros((len(medium_met_ids), n), dtype=np.float32)
     for col_idx, rxn_obj in enumerate(model.reactions):
         rxn_id = rxn_obj.id
 
-        # Biomass "reaction" row
         if rxn_id == biomass_rxn_id:
-            if 'BIOMASS' in medium_met_ids:
-                row_idx = medium_met_ids.index('BIOMASS')
+            if "BIOMASS" in medium_met_ids:
+                row_idx = medium_met_ids.index("BIOMASS")
                 Transport[row_idx, col_idx] = 1.0
                 if verbose:
-                    print(f'Transport[{row_idx},{col_idx}] = 1.0  BIOMASS')
+                    print(f"Transport[{row_idx},{col_idx}] = 1.0  BIOMASS")
             continue
 
-        # Exchange reactions, e.g. EX_glc__D_e(o/i)
-        if rxn_id.startswith('EX_'):
-            io = rxn_id[-1:]      # 'o' or 'i'
-            met_id_candidate = rxn_id[3:-2]  # EX_glc__D_e -> glc__D
+        if rxn_id.startswith("EX_"):
+            io = rxn_id[-1:]
+            met_id_candidate = rxn_id[3:-2]
             if met_id_candidate in medium_met_ids:
                 row_idx = medium_met_ids.index(met_id_candidate)
-                Transport[row_idx, col_idx] = -1.0 if io == 'i' else 0 # !!! 
-                if met_id_candidate == 'ac_e':
-                    Transport[row_idx, col_idx] = -1.0 if io == 'i' else 1
-                if verbose and Transport[row_idx, col_idx]:
-                    print(f'Transport[{row_idx},{col_idx}] = {Transport[row_idx, col_idx]}  {rxn_id} {met_id_candidate}')
+                Transport[row_idx, col_idx] = -1.0 if io == "i" else 0.0
+
+                if met_id_candidate == "ac_e" or met_id_candidate == "TARGET": 
+                    Transport[row_idx, col_idx] = -1.0 if io == "i" else 1.0
+
+                if verbose and Transport[row_idx, col_idx] != 0:
+                    print(
+                        f"Transport[{row_idx},{col_idx}] = "
+                        f"{Transport[row_idx, col_idx]}  {rxn_id} {met_id_candidate}"
+                    )
 
     if verbose:
-        print(f'Transport shape: {Transport.shape}, Stoichiometry shape: {Stoichiometry.shape}')
-        print(f'Number of metabolites (k): {len(medium_met_ids)}, Number of fluxes (n): {n}')
-        
+        print(f"Transport shape: {Transport.shape}, Stoichiometry shape: {Stoichiometry.shape}")
+        print(f"Number of metabolites (k): {len(medium_met_ids)}, Number of fluxes (n): {n}")
+
     return Stoichiometry, Transport, m, n, rxn_ids
 
-def process_data(
-    media_file: str,
-    od_file: str,
-    cobra_model_file: str,
-    biomass_rxn_id: str,
-    verbose=False
-) -> Tuple[np.ndarray, List[str], Dict[int, np.ndarray], Dict[int, np.ndarray], np.ndarray, np.ndarray, List[str]]:
+def build_reaction_ko_matrix(
+    media_df: pd.DataFrame,
+    ko_cols: List[str],
+    model: cobra.Model,
+    rxn_ids: List[str],
+    verbose: bool = False
+) -> np.ndarray:
     """
-    Process media, OD/CONC, and COBRA model to generate structured experimental data and matrices.
+    Build a binary reaction_KO matrix of shape (num_rows, num_reactions).
 
-    Handles two cases:
-      - OD mode (M28_*): od_file has columns like T_1, OD_1, DEV_1, T_2, ...
-      - CONC mode (Millard_*): od_file has T_1, GLC_1, DEV_1, ACE_1, DEV_1.1, BIOMASS_1, DEV_1.2, ...
+    For each row:
+      - find KO genes from columns KO_<gene_name> with value == 1
+      - map gene names to COBRA gene ids
+      - evaluate each reaction's GPR with those knockouts
+      - reaction_KO[row, j] = 1 if reaction j becomes non-functional
     """
-    media_df = pd.read_csv(media_file)
-    od_df = pd.read_csv(od_file)
+    
+    if len(ko_cols) < 1:
+        return None
+        
+    n_rows = len(media_df)
+    n_rxns = len(rxn_ids)
+    reaction_KO = np.zeros((n_rows, n_rxns), dtype=np.float32)
 
-    # Detect OD vs concentration mode from column names
-    cols_upper = [c.upper() for c in od_df.columns]
-    is_od_mode = any("OD" in c for c in cols_upper)
+    rxn_objects = [model.reactions.get_by_id(rid) for rid in rxn_ids]
+    model_gene_ids = {g.id for g in model.genes}
 
-    # ---- Common: define metabolite_ids from media + BIOMASS ----
-    # Use all media metabolites (skip the first column 'ID') and add BIOMASS at the end.
-    metabolite_ids = list(media_df.columns[1:])
-    if 'BIOMASS' not in metabolite_ids:
-        metabolite_ids.append('BIOMASS')
+    # Map gene names -> gene ids
+    gene_name_to_id = {}
+    for g in model.genes:
+        if g.name is not None and str(g.name).strip() != "":
+            gene_name_to_id[str(g.name).strip()] = g.id
 
-    # ---- Define time grid ----
-    # For OD: union of all T_* columns (what you had before).
-    # For CONC: we can safely use the first T_* column.
-    t_cols = [c for c in od_df.columns if c.startswith('T_')]
-    if not t_cols:
-        raise ValueError("No time columns like 'T_<id>' found in measurement file.")
+    for row_idx, (_, row) in enumerate(media_df.iterrows()):
+        knocked_out_gene_ids: Set[str] = set()
+        knocked_out_gene_names: Set[str] = set()
 
-    if is_od_mode:
-        # Original behaviour: all unique times from T_* columns
-        times_all = pd.unique(od_df[t_cols].values.flatten())
-        times = np.array(sorted(t for t in times_all if not pd.isnull(t)), dtype=float)
-    else:
-        # Concentration mode: just use the time vector from the first T_* column
-        times = od_df[t_cols[0]].to_numpy(dtype=float)
+        for ko_col in ko_cols:
+            val = row[ko_col]
+            if pd.notna(val) and float(val) == 1.0:
+                gene_name = str(ko_col)[3:]   # remove "KO_"
+                knocked_out_gene_names.add(gene_name)
 
-    # ---- Prepare containers ----
+                if gene_name in gene_name_to_id:
+                    knocked_out_gene_ids.add(gene_name_to_id[gene_name])
+
+        missing_names = knocked_out_gene_names - set(gene_name_to_id.keys())
+        if verbose and missing_names:
+            print(
+                f"[build_reaction_ko_matrix] warning: gene names not found in model: "
+                f"{sorted(missing_names)}"
+            )
+
+        missing_ids = knocked_out_gene_ids - model_gene_ids
+        if verbose and missing_ids:
+            print(
+                f"[build_reaction_ko_matrix] warning: mapped gene ids not found in model: "
+                f"{sorted(missing_ids)}"
+            )
+
+        for j, rxn in enumerate(rxn_objects):
+            if not rxn.gene_reaction_rule:
+                continue
+
+            try:
+                is_functional = rxn.gpr.eval(knockouts=knocked_out_gene_ids)
+                reaction_KO[row_idx, j] = 0.0 if is_functional else 1.0
+            except Exception:
+                rxn_gene_ids = {g.id for g in rxn.genes}
+                reaction_KO[row_idx, j] = 1.0 if len(rxn_gene_ids & knocked_out_gene_ids) > 0 else 0.0
+    if verbose:
+        print(f"Reaction KO shape: {reaction_KO.shape}")
+
+    return reaction_KO
+    
+###############################################################################
+# Parse measurement 
+###############################################################################
+
+def parse_measurement_layout(meas_df: pd.DataFrame):
+    """
+    Parse a measurement file with columns like:
+        time, X_1, DEV_1, X_2, DEV_2, ...
+
+    Returns
+    -------
+    layout : dict
+        layout[exp_id] = {
+            "measurements": [
+                {"name": "BIOMASS", "value_col": "BIOMASS_1", "dev_col": "DEV_1"},
+                {"name": "VIO",     "value_col": "VIO_1",     "dev_col": "DEV_1.1"},
+                ...
+            ]
+        }
+    measurement_names : list of str
+        Unique measurement names found in the file.
+    """
+    cols = list(meas_df.columns)
+
+    if "time" not in cols:
+        raise ValueError("Measurement file must contain a single 'time' column.")
+
+    layout = {}
+    measurement_names = []
+
+    i = 1  # skip 'time'
+    while i < len(cols):
+        value_col = cols[i]
+
+        # Skip stray DEV columns if any
+        if str(value_col).startswith("DEV_"):
+            i += 1
+            continue
+
+        if "_" not in str(value_col):
+            raise ValueError(
+                f"Measurement column '{value_col}' does not follow the expected NAME_ID format."
+            )
+
+        value_name, exp_id_str = str(value_col).rsplit("_", 1)
+        exp_id = int(exp_id_str)
+
+        dev_col = None
+        if i + 1 < len(cols) and str(cols[i + 1]).startswith("DEV_"):
+            dev_col = cols[i + 1]
+            i += 2
+        else:
+            i += 1
+
+        if exp_id not in layout:
+            layout[exp_id] = {"measurements": []}
+
+        layout[exp_id]["measurements"].append(
+            {"name": value_name, "value_col": value_col, "dev_col": dev_col}
+        )
+
+        if value_name not in measurement_names:
+            measurement_names.append(value_name)
+
+    return layout, measurement_names
+
+###############################################################################
+# Process data 
+###############################################################################
+
+def process_measurement(
+    media_only_df: pd.DataFrame,
+    meas_df: pd.DataFrame,
+    metabolite_ids: List[str],
+    times: np.ndarray,
+    verbose: bool = False
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    """
+    Process a measurement file with a single shared 'time' column and one or more
+    measurements per experiment.
+
+    Expected columns:
+      time, X_1, DEV_1, X_2, DEV_2, ...
+
+    Rules
+    -----
+    - all measured values are assumed to already be concentrations
+    - BIOMASS is treated as a special state variable, but no conversion is applied
+    - media is inserted at time 0
+    - missing deviations default to zeros
+    - the shared time column may extend beyond available measurements
+    """
     experiment_data: Dict[int, np.ndarray] = {}
     dev_data: Dict[int, np.ndarray] = {}
 
-    # Which experiment IDs are actually present in the measurement file?
-    # We detect them from T_<id> columns.
-    present_ids = set()
-    for c in t_cols:
-        try:
-            _, eid_str = c.split('_', 1)
-            present_ids.add(int(eid_str))
-        except Exception:
-            pass
+    layout, _ = parse_measurement_layout(meas_df)
+    present_ids = set(layout.keys())
+    local_times = meas_df["time"].to_numpy(dtype=float)
 
-    # A) OD MODE (M28_*)
-    if is_od_mode:
-        if verbose:
-            print("[process_data] detected OD mode (M28-style OD + DEV)")
+    for exp_id in media_only_df["ID"]:
+        exp_id = int(exp_id)
+        if exp_id not in present_ids:
+            continue
 
-        for exp_id in media_df['ID']:
-            if int(exp_id) not in present_ids:
-                # No T_exp_id, OD_exp_id columns => skip this experiment
+        conc_matrix = np.full((len(times), len(metabolite_ids)), np.nan, dtype=np.float32)
+        dev_matrix = np.full((len(times), len(metabolite_ids)), 0.0, dtype=np.float32)
+
+        # Insert media at time 0
+        row_in_media = media_only_df.loc[
+            media_only_df["ID"] == exp_id
+        ].iloc[0, 1:].to_numpy(dtype=np.float32)
+
+        if np.any(np.isclose(times, 0.0)):
+            t0_idx = np.where(np.isclose(times, 0.0))[0][0]
+        else:
+            t0_idx = 0
+
+        conc_matrix[t0_idx, :len(row_in_media)] = row_in_media
+
+        for meas in layout[exp_id]["measurements"]:
+            met_name = meas["name"]
+            if met_name not in metabolite_ids:
                 continue
 
-            t_col  = f'T_{int(exp_id)}'
-            od_col = f'OD_{int(exp_id)}'
-            dev_col = f'DEV_{int(exp_id)}'
+            met_idx = metabolite_ids.index(met_name)
+            values = meas_df[meas["value_col"]].to_numpy(dtype=np.float32)
 
-            if t_col not in od_df.columns or od_col not in od_df.columns:
-                raise ValueError(f'Missing columns for experiment ID {exp_id} in OD file.')
-
-            od_times = od_df[t_col].values
-            log_od_values = od_df[od_col].values
-            log_od_dev = od_df[dev_col].values
-            dev_data[int(exp_id)] = log_od_dev  # keep as in original code
-
-            od_values = np.exp(log_od_values)
-            biomass_concentration = utils.OD_to_concentration(od_values)
-
-            # Matrix: (T, k) with NaNs, only biomass column filled
-            conc_matrix = np.full((len(times), len(metabolite_ids)), np.nan, dtype=np.float32)
-
-            # Set initial media concentrations (excluding biomass)
-            row_in_media = media_df[media_df['ID'] == exp_id].iloc[0, 1:].values
-            conc_matrix[0, :-1] = row_in_media
-
-            # Set biomass over time by matching od_times to global 'times'
-            # Biomass index is last column
-            bio_idx = len(metabolite_ids) - 1
-
-            # If 0 in od_times, use that as t0, else first measured
-            if 0 in od_times:
-                idx_0 = np.where(od_times == 0)[0][0]
-                conc_matrix[0, bio_idx] = biomass_concentration[idx_0]
+            if meas["dev_col"] is not None and meas["dev_col"] in meas_df.columns:
+                dev_values = meas_df[meas["dev_col"]].to_numpy(dtype=np.float32)
             else:
-                conc_matrix[0, bio_idx] = biomass_concentration[0]
+                dev_values = np.zeros(len(local_times), dtype=np.float32)
 
-            for i_time, t_val in enumerate(times[1:], start=1):
-                if t_val in od_times:
-                    idx_t = np.where(od_times == t_val)[0][0]
-                    conc_matrix[i_time, bio_idx] = biomass_concentration[idx_t]
+            for i_time, t_val in enumerate(times):
+                if t_val in local_times:
+                    idx_t = np.where(local_times == t_val)[0][0]
+                    if not np.isnan(values[idx_t]):          # never overwrite with NaN
+                        conc_matrix[i_time, met_idx] = values[idx_t]
+                        dev_matrix[i_time, met_idx] = dev_values[idx_t]
 
-            experiment_data[int(exp_id)] = conc_matrix
+        experiment_data[exp_id] = conc_matrix
+        dev_data[exp_id] = dev_matrix
 
-    # B) CONCENTRATION MODE (Millard_*): GLC, ACE, BIOMASS already in conc.
-    else:
-        if verbose:
-            print("[process_data] detected concentration mode (Millard-style GLC/ACE/BIOMASS)")
+    if verbose:
+        print("[process_data] detected generic measurement mode (single shared time column)")
 
-        # Map model metabolite IDs → column prefixes in the Millard file
-        # This is specific to your current files:
-        #   glc__D_e -> GLC_<id>
-        #   ac_e     -> ACE_<id>
-        #   BIOMASS  -> BIOMASS_<id>
-        def _col_for_met(exp_id: int, met_id: str) -> str:
-            if met_id == 'BIOMASS':
-                return f'BIOMASS_{exp_id}'
-            elif met_id == 'glc__D_e':
-                return f'GLC_{exp_id}'
-            elif met_id == 'ac_e':
-                return f'ACE_{exp_id}'
-            else:
-                # For now, we have only these three; others would be NaN.
-                return None
+    return experiment_data, dev_data
+    
+def process_data(
+    media_file: str,
+    measurement_file: str,
+    cobra_model_file: str,
+    biomass_rxn_id: str,
+    verbose=False
+) -> Tuple[
+    np.ndarray,
+    List[str],
+    Dict[int, np.ndarray],
+    Dict[int, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    List[str]
+]:
+    """
+    Process media(+KO), measurements, and COBRA model to generate structured data.
 
-        # For now, only experiments that actually appear in measurement file
-        # (Millard_12_1 has only ID=1).
-        for exp_id in media_df['ID']:
-            if int(exp_id) not in present_ids:
-                continue  # no T_<id> / GLC_<id> etc. for this experiment
+    Parameters
+    ----------
+    media_file : str
+        File containing ID, media columns, and optionally KO_<gene> columns.
+    measurement_file : str
+        Measurement file containing:
+            time, X_1, DEV_1, X_2, DEV_2, ...
+    cobra_model_file : str
+        SBML file for the strain model.
+    biomass_rxn_id : str
+        Biomass reaction ID.
+    """
+    media_df = pd.read_csv(media_file, encoding="latin1")
+    media_df.columns = [
+        c.encode("ascii", errors="ignore").decode("ascii").strip()
+        for c in media_df.columns
+    ]
 
-            t_col = f'T_{int(exp_id)}'
-            if t_col not in od_df.columns:
-                raise ValueError(f"Missing time column {t_col} for experiment {exp_id}")
+    meas_df = pd.read_csv(measurement_file)
+    media_only_df, media_metabolite_ids, ko_cols = split_media_and_ko_columns(media_df)
 
-            # time vector for this experiment (should match 'times')
-            local_times = od_df[t_col].to_numpy(dtype=float)
-            if len(local_times) != len(times) or not np.allclose(local_times, times):
-                # If they differ, you could resample/align; for now we enforce equality.
-                raise ValueError(f"Time grid mismatch for experiment {exp_id}")
+    if "time" not in meas_df.columns:
+        raise ValueError("Measurement file must contain a single 'time' column.")
+    _, measurement_names = parse_measurement_layout(meas_df)
 
-            # Allocate (T, k) and fill from measured GLC/ACE/BIOMASS
-            T = len(times)
-            k = len(metabolite_ids)
-            conc_matrix = np.full((T, k), np.nan, dtype=np.float32)
+    # Build metabolite_ids = media metabolites + measured variables (no duplicates)
+    metabolite_ids = list(media_metabolite_ids)
+    for meas_name in measurement_names:
+        if meas_name not in metabolite_ids:
+            metabolite_ids.append(meas_name)
 
-            for j, met_id in enumerate(metabolite_ids):
-                col_name = _col_for_met(int(exp_id), met_id)
-                if col_name is not None and col_name in od_df.columns:
-                    conc_matrix[:, j] = od_df[col_name].to_numpy(dtype=np.float32)
-                else:
-                    # Leave as NaN (unmeasured species)
-                    pass
+    # Check measured variables against SBML model
+    validate_measured_ids(
+        cobra_model_file,
+        measurement_names,
+        verbose=verbose
+    )
 
-            # Store biomass dev only (1D) if we find a DEV column for BIOMASS
-            dev_col_candidates = [c for c in od_df.columns
-                                  if c.startswith(f'DEV_{int(exp_id)}') and 'BIOMASS' not in c.upper()]
-            # In Millard_12_1 we have DEV_1, DEV_1.1, DEV_1.2; biomass dev is DEV_1.2
-            biomass_dev_col = None
-            for c in od_df.columns:
-                if c.startswith(f'DEV_{int(exp_id)}') and c.endswith('.2'):
-                    biomass_dev_col = c
-                    break
-            if biomass_dev_col is not None:
-                dev_data[int(exp_id)] = od_df[biomass_dev_col].to_numpy(dtype=np.float32)
-            else:
-                dev_data[int(exp_id)] = np.zeros(T, dtype=np.float32)
+    times = meas_df["time"].to_numpy(dtype=float)
+    experiment_data, dev_data = process_measurement(
+        media_only_df=media_only_df,
+        meas_df=meas_df,
+        metabolite_ids=metabolite_ids,
+        times=times,
+        verbose=verbose,
+    )
 
-            experiment_data[int(exp_id)] = conc_matrix
-
-    # ---- Build stoichiometric and transport matrices from COBRA ----
+    model = cobra.io.read_sbml_model(cobra_model_file)
     Stoichiometry, Transport, _, _, rxn_ids = build_Stoichiometry_and_Transport_from_cobra(
         cobra_model_file, metabolite_ids, biomass_rxn_id, verbose=verbose
     )
 
-    return np.array(times, dtype=np.float32), metabolite_ids, experiment_data, dev_data, Stoichiometry, Transport, rxn_ids
-
-
-def prepare_experiment_array(
-    T: int,
-    metabolite_ids: List[str],
-    experiment_data: Dict[int, np.ndarray]
-) -> np.ndarray:
-    """
-    Flatten experimental data into a 2D array with shape (Z, T*k).
-    This exactly reproduces the old behavior:
-    - Always take the FIRST T rows
-    - Always take ALL columns (all metabolites)
-    - Always do row-major flattening
-    """
-    k = len(metabolite_ids)
-    all_flat = []
-
-    for exp_id in experiment_data.keys():
-        conc_matrix = experiment_data[exp_id]
-
-        # Old behavior: ALWAYS take first T rows
-        row_flat = conc_matrix[:T, :].reshape(-1)
-
-        all_flat.append(row_flat)
-
-    return np.stack(all_flat, axis=0)
+    reaction_KO = build_reaction_ko_matrix(
+        media_df=media_df,
+        ko_cols=ko_cols,
+        model=model,
+        rxn_ids=rxn_ids,
+        verbose=verbose,
+    )
     
+    return (
+        np.array(times, dtype=np.float32),
+        metabolite_ids,
+        experiment_data,
+        dev_data,
+        Stoichiometry,
+        reaction_KO,
+        Transport,
+        rxn_ids,
+    )
+    
+###############################################################################
+# Prepare array
+###############################################################################
+
 def prepare_experiment_array(
     time_ids: np.ndarray,
     metabolite_ids: List[str],
@@ -374,283 +466,16 @@ def prepare_experiment_array(
         - either an integer T (number of time steps),
         - or a 1D array of times of length T.
     """
-    k = len(metabolite_ids)
-    # Normalize time_ids → T (number of rows to keep)
     if isinstance(time_ids, (int, np.integer)):
         T = int(time_ids)
     else:
         T = len(time_ids)
+
     all_flat = []
     for exp_id in experiment_data.keys():
-        conc_matrix = experiment_data[exp_id]          # shape (T_full, k)
-        # Keep first T rows (you use the same time grid for all experiments)
-        conc_slice = conc_matrix[:T, :]                # shape (T, k)
-        row_flat = conc_slice.reshape(-1)              # (T*k,)
+        conc_matrix = experiment_data[exp_id]
+        conc_slice = conc_matrix[:T, :]
+        row_flat = conc_slice.reshape(-1)
         all_flat.append(row_flat)
 
     return np.stack(all_flat, axis=0)
-
-def build_dfba_inputs(
-    media_file,
-    od_file,
-    cobra_model_file,
-    biomass_rxn_id,
-    verbose=False,
-):
-    """
-    Build full time-series and concentration arrays for ALL experiments,
-    without any train/validation split and without creating a MetabolicModel.
-
-    This is the natural entry point for dFBA-style simulations.
-
-    Returns
-    -------
-    times : np.ndarray, shape (T,)
-        Time points (same for all experiments).
-    metabolite_ids : list of str, length k
-        External metabolites + BIOMASS (same ordering as in the arrays).
-    experiment_array : np.ndarray, shape (Z, T, k)
-        Full concentration trajectories for each experiment (Z), all time
-        points (T) and all metabolites (k), constructed as in
-        `prepare_experiment_array`.
-    dev_array : np.ndarray or None
-        Dev data stacked as an array if available, otherwise None.
-    exp_ids : list
-        List of experiment IDs (keys of experiment_data) in the same order
-        as the first dimension of `experiment_array`.
-    Stoichiometry : np.ndarray
-        Stoichiometric matrix returned by `process_data`.
-    Transport : np.ndarray
-        Transport matrix returned by `process_data`.
-    rxn_ids : list of str
-        Reaction IDs returned by `process_data`.
-    """
-
-    # 1) Parse input files with the same logic as in create_model_train_val
-    times, metabolite_ids, experiment_data, dev_data, \
-        Stoichiometry, Transport, rxn_ids = process_data(
-            media_file,
-            od_file,
-            cobra_model_file,
-            biomass_rxn_id,
-            verbose=verbose,
-        )
-
-    # 2) Fix experiment ordering and build the full (Z, T, k) array
-    exp_ids = list(experiment_data.keys())
-    # keep order as-is, or sort if you prefer deterministic ordering:
-    # exp_ids.sort()
-
-    total_time_steps = len(times)
-    # experiment_data is a dict {exp_id: (T, k)}; reuse your helper
-    experiment_array = prepare_experiment_array(
-        total_time_steps,
-        metabolite_ids,
-        {eid: experiment_data[eid] for eid in exp_ids},
-    )
-
-    # 3) Dev data as array (if present)
-    dev_values = list(dev_data.values())
-    dev_array = np.asarray(dev_values) if len(dev_values) > 0 else None
-
-    if verbose:
-        print(f"[build_dfba_inputs] #experiments Z = {len(exp_ids)}")
-        print(f"[build_dfba_inputs] #time points T = {len(times)}")
-        print(f"[build_dfba_inputs] #metabolites k = {len(metabolite_ids)}")
-        print(f"[build_dfba_inputs] experiment_array shape = {experiment_array.shape}")
-        if dev_array is not None:
-            print(f"[build_dfba_inputs] dev_array shape = {dev_array.shape}")
-
-    return (
-        times,
-        metabolite_ids,
-        experiment_array,
-        dev_array,
-        exp_ids,
-        Stoichiometry,
-        Transport,
-        rxn_ids,
-    )
-
-def predict_dFBA(
-    cobra_model_file,
-    biomass_rxn_id,
-    media_conc,
-    ex_ids,
-    time_points,
-    volume=1.0,
-    uptake_scaler=None,
-    solver="glpk",
-    mu_max=2.0,
-    X0=0.01,
-    X_max=10.0,
-    X_init=None,
-    verbose=False
-):
-    """
-    Classical dynamic FBA predictor (single medium condition).
-
-    Parameters
-    ----------
-    cobra_model_file : str
-        Path to SBML/XML metabolic model.
-    biomass_rxn_id : str
-        ID of the biomass reaction to maximize.
-    media_conc : np.array shape (k_ex,) or (1, k_ex)
-        Initial extracellular metabolite concentrations, for the
-        subset of metabolites corresponding to ex_ids.
-        IMPORTANT: should NOT include BIOMASS.
-    ex_ids : list of str
-        Exchange reaction IDs corresponding to media_conc.
-        (Do NOT include essential ions if you want them unconstrained.)
-    time_points : np.array shape (T,)
-        Simulation time grid (hours).
-    volume : float
-        Culture volume (L).
-    uptake_scaler : array-like or None
-        Per–metabolite scaling factor for uptake.
-        Uptake bound is set as:
-            v_max_i(t) = uptake_scaler[i] * C_i(t) / dt / volume
-        If None, all ones are used.
-    solver : str
-        COBRA solver.
-    mu_max : float
-        Maximum allowed growth rate (1/hr) to avoid overflow.
-    X0 : float
-        Default initial biomass (gDW/L) used if X_init is None.
-    X_max : float
-        Maximum allowed biomass (gDW/L) to avoid overflow.
-    X_init : float or None
-        Experimental initial biomass (gDW/L). If not None, this
-        value is used as X[0] instead of X0.
-
-    Returns
-    -------
-    pred_biomass : np.array shape (T,)
-        Biomass concentration predicted by dFBA at each time point.
-    """
-
-    import cobra
-    import numpy as np
-
-    # ------------------------------------------------------------
-    # 0. Ensure media_conc is 1D and consistent with ex_ids
-    # ------------------------------------------------------------
-    media_conc = np.asarray(media_conc, dtype=float)
-    if media_conc.ndim == 2 and media_conc.shape[0] == 1:
-        media_conc = media_conc[0]
-
-    if media_conc.ndim != 1:
-        raise ValueError(
-            f"media_conc must be 1D (k_ex,) or (1,k_ex), got shape {media_conc.shape}"
-        )
-
-    if len(ex_ids) != media_conc.shape[0]:
-        raise ValueError(
-            f"len(ex_ids) = {len(ex_ids)} but media_conc has length {media_conc.shape[0]}.\n"
-            "They must match and correspond to the same metabolites."
-        )
-
-    # Handle uptake_scaler
-    if uptake_scaler is None:
-        uptake_scaler = np.ones_like(media_conc, dtype=float)
-    else:
-        uptake_scaler = np.asarray(uptake_scaler, dtype=float)
-        if uptake_scaler.shape != media_conc.shape:
-            raise ValueError(
-                f"uptake_scaler shape {uptake_scaler.shape} does not match media_conc {media_conc.shape}"
-            )
-
-    # ------------------------------------------------------------
-    # 1. Load metabolic model
-    # ------------------------------------------------------------
-    model = cobra.io.read_sbml_model(cobra_model_file)
-    model.solver = solver
-
-    if biomass_rxn_id not in model.reactions:
-        raise ValueError(f"Biomass reaction {biomass_rxn_id} not found in the model.")
-    biomass_rxn = model.reactions.get_by_id(biomass_rxn_id)
-
-    # Optional: check all ex_ids exist
-    for ex in ex_ids:
-        if ex not in model.reactions:
-            raise ValueError(f"Exchange reaction {ex} not found in the model.")
-
-    # ------------------------------------------------------------
-    # 2. Prepare time grid and initial conditions
-    # ------------------------------------------------------------
-    time_points = np.asarray(time_points, dtype=float)
-    T = len(time_points)
-    if T < 2:
-        raise ValueError("time_points must contain at least 2 values.")
-
-    dt = np.diff(time_points)
-    dt = np.maximum(dt, 1e-6)  # avoid zeros/negatives
-
-    # Biomass trajectory
-    X = np.zeros(T, dtype=float)
-    # Use experimental initial biomass if provided, otherwise X0
-    if X_init is not None:
-        X[0] = float(X_init)
-    else:
-        X[0] = float(X0)
-
-    # Extracellular concentrations for the k_ex metabolites
-    C = media_conc.copy()  # shape (k_ex,)
-
-    # ------------------------------------------------------------
-    # 3. dFBA integration loop
-    # ------------------------------------------------------------
-    for t in range(T - 1):
-
-        dt_t = float(dt[t])
-
-        # (a) Set uptake bounds from concentrations using scalers
-        for i, ex in enumerate(ex_ids):
-            rxn = model.reactions.get_by_id(ex)
-            C_i = max(C[i], 0.0)
-
-            # v_max_i = s_i * C_i / (dt * V)
-            v_max_i = uptake_scaler[i] * C_i / dt_t / volume
-
-            # For this model we assume uptake via positive flux
-            # keep existing lower_bound, only tighten upper_bound
-            rxn.upper_bound = v_max_i
-
-        # (b) Solve steady-state FBA for growth
-        solution = model.optimize()
-
-        if (solution.status != "optimal") or (solution.objective_value is None):
-            mu = 0.0
-            uptake_fluxes = np.zeros(len(ex_ids), dtype=float)
-        else:
-            mu_raw = float(solution.objective_value)
-            if not np.isfinite(mu_raw):
-                mu = 0.0
-            else:
-                mu = max(0.0, min(mu_raw, mu_max))
-
-            uptake_fluxes = np.array(
-                [solution.fluxes.get(ex_id, 0.0) for ex_id in ex_ids],
-                dtype=float
-            )
-
-        # (c) Update extracellular metabolites (uptake is positive flux)
-        v_up = np.maximum(uptake_fluxes, 0.0)  # shape (k_ex,)
-
-        dCdt = -v_up * X[t] / volume
-        C_prev = C
-        C = C + dCdt * dt_t
-        C = np.maximum(C, 0.0)
-
-        # (d) Update biomass (exponential growth)
-        X_next = X[t] * np.exp(mu * dt_t)
-        if not np.isfinite(X_next):
-            X_next = X[t]
-        X_next = min(X_next, X_max)
-        X[t + 1] = X_next
-
-        if verbose:
-            print(f't={t} mu={mu} C={C_prev} dt={dt_t} X[t]={X[t]} -> X[t+1]={X_next} C[t+1]={C}')
-
-    return X
