@@ -7,7 +7,18 @@ This repository contains the reference implementation of dAMN, a hybrid modellin
 - a neural network predicting effective intracellular flux distributions from initial media composition, and  
 - a dynamic FBA (dFBA) engine simulating extracellular metabolite and biomass trajectories.
 
-dAMN supports both OD-based and concentration-based time-series datasets, automatically detected by the loader.
+Release v1.0.0 is the implementation used for the dAMN publication. This
+version adds:
+- **gene knockouts**: media files can list knocked-out genes, which dAMN maps
+  to reactions through the gene-reaction rules of the metabolic model and
+  uses in training (section 4);
+- a single, generic time-series format for biomass and any measured
+  metabolite (section 3), replacing the separate OD and concentration formats;
+- held-out measured variables (`measure-<id>`), e.g. training on glucose and
+  biomass and predicting acetate;
+- a classical dFBA baseline (`dFBA.py`, `dFBA.ipynb`), new datasets
+  (violacein-producing strains with knockouts, `VIO_*`), and benchmarks of
+  dAMN against dFBA and a pure MLP (`benchmarks/`).
 
 ---
 
@@ -15,118 +26,90 @@ dAMN supports both OD-based and concentration-based time-series datasets, automa
 
 The project is organised as follows:
 
-    data/                     Experimental datasets (media tables, OD files, concentration files, SBML model)
+    data/                     Experimental datasets (media tables, time-series files, SBML models)
     figure/                   Training curves, prediction plots, diagnostics (auto-generated)
-    model/                    Trained model weights, validation arrays, run outputs
-    model_xfold/              Outputs from cross-validation or repeated training runs
-    __pycache__/              Python cache directory
+    model/                    Trained model weights and validation arrays
+    benchmarks/               dAMN vs dFBA vs MLP (see benchmarks/README.md)
 
     dAMN.ipynb                Main notebook: data loading, training, prediction, visualisation
-    dAMN_parameter_search.py  Parameter and hyperparameter search utility
-    data.py                   Data loading, automatic format detection, preprocessing, structure building
+    dAMN_parameter_search.py  Loss-weight and decay parameter search
+    data.py                   Data loading, knockouts, preprocessing, structure building
     model.py                  Neural network definition and dFBA integration routines
     plot.py                   Plotting utilities
-    utils.py                  Auxiliary functions (loss terms, normalization, batching, etc.)
-    environment.yaml          Conda environment specification
+    utils.py                  Auxiliary functions (OD conversion, R2, etc.)
+    dFBA.py                   Classical dFBA baseline (inputs and per-medium simulation)
+    dFBA.ipynb                dFBA benchmark on the M28 dataset
+    RP2SBML.ipynb             Prepares the violacein model (iML1515_VIO_duplicated.xml): product reaction as exchange
+    environment.yml           Conda environment specification
     LICENSE                   License information
     README.md                 Project documentation
     README.rtf                Legacy documentation (superseded by this file)
 
 ---
 
-## 2. Supported Data Formats
+## 2. Media File Format
 
-The dAMN framework supports two mutually exclusive types of experimental time-series datasets.
-Both formats rely on a common media file and must be placed in the `data/` directory.
+Initial extracellular conditions for each experiment are specified in a CSV
+file (`data/*_media*.csv`):
 
-The two supported dataset types are:
-
-1. OD-based time series (e.g., M28 dataset)  
-2. Concentration-based time series (e.g., Millard dataset)
-
-The system automatically detects which format is being used.
-
----
-
-### 2.1 Media File Format (Common to All Datasets)
-
-Initial extracellular conditions for each experiment are specified in a CSV file with the following structure:
-
-    ID, <met1>, <met2>, ..., <metN>
+    ID, <met1>, <met2>, ..., <metN> [, KO_<gene1>, KO_<gene2>, ...]
 
 Rules:
-- `ID` uniquely identifies an experiment.
-- All other columns correspond to extracellular metabolites from the COBRA model.
+- `ID` uniquely identifies an experiment (one row per experiment).
+- Metabolite columns are extracellular metabolite IDs of the COBRA model;
+  values are initial concentrations.
 - `BIOMASS` must not appear in this table; it is appended internally as the last species.
-- One row per experiment.
-
-This media file is used to initialise extracellular metabolite concentrations before each dFBA simulation.
-
----
-
-## 3. OD-Based Time-Series Format
-
-This format is used when only optical density (OD) measurements are available.  
-dAMN converts OD values into biomass concentration using internal transformation functions.
-
-A typical file for experiment X contains:
-
-    T_X, OD_X, DEV_X
-
-Where:
-- `T_X`  = time points  
-- `OD_X` = OD measurements (raw or log-transformed)  
-- `DEV_X` = optional measurement deviation  
-
-Characteristics:
-- Only BIOMASS is experimentally observed.
-- OD is exponentiated when required and mapped to biomass internally.
-- The loader automatically detects this format when any column contains `OD_` or `DEV_`.
-
-Internal representation:
-- If the media file defines `k` metabolites, the internal dynamic vector becomes  
-  `[media_metabolites..., BIOMASS]`
-- BIOMASS is always stored at the last index.
+- Optional knockout columns start at the first header beginning with `KO_`
+  (section 4).
 
 ---
 
-## 4. Concentration-Based Time-Series Format
+## 3. Time-Series Format
 
-This format is used when extracellular metabolite concentrations are directly measured.
+Measurements are given in a CSV file with a single shared time column:
 
-Required CSV structure:
-
-    time, <met1>, <met2>, ..., BIOMASS
+    time, <var>_<ID>, DEV_..., <var>_<ID>, DEV_..., ...
 
 Rules:
-- `BIOMASS` must be present and must be the last column.
-- Column names must match extracellular metabolite IDs in the COBRA model.
-- Units must be consistent with the media file.
-- Any number of metabolites may be measured.
+- `<var>` is `BIOMASS` (gDW/L) or an extracellular metabolite ID of the COBRA
+  model (e.g. `glc__D_e`, `ac_e`), `<ID>` the experiment ID of the media file.
+- Each value column may be followed by a deviation column whose name starts
+  with `DEV_` (e.g. `DEV_1` or `DEV_BIOMASS_1`); missing deviations are zero.
+- Several variables can be measured per experiment; values may be missing
+  (empty cells).
+- The media composition is inserted as the first time point.
 
-Internal structure:
-- If metabolites are `[GLC, ACE, ...]`, the internal state vector becomes  
-  `[GLC, ACE, ..., BIOMASS]`.
+Examples: `M28_conc_20.csv` (biomass of 280 media),
+`Millard_conc_12.csv` (glucose, acetate and biomass of one culture),
+`VIO_conc_17.csv` (biomass and violacein, `TARGET`).
 
-The total dimension equals the number of measured metabolites.
-
----
-
-## 5. Automatic Format Detection
-
-The dataset type is determined automatically by the loader (`process_data()` in `data.py`).
-
-Detection rules:
-- If any column name contains `OD_` or `DEV_` → OD-based dataset.
-- Otherwise, if valid metabolite columns exist and the last column is `BIOMASS` → concentration-based dataset.
-
-This mechanism ensures seamless switching between dataset formats.
+The OD and concentration files of release v1.0.0 (`M28_OD_20.csv`,
+`Millard_12_1.csv`, ...) are kept in `data/` for reference; they are read by
+v1.0.0 only.
 
 ---
 
-## 6. Critical Internal Convention
+## 4. Gene Knockouts
 
-Regardless of dataset format:
+A column `KO_<gene>` of the media file set to 1 knocks out `<gene>` (gene name
+as in the COBRA model) in that experiment. For each experiment, `data.py`
+evaluates the gene-reaction rules of the model with these genes removed and
+builds a binary matrix `reaction_KO` (experiments × reactions), 1 for every
+reaction that loses all its enzymes (`build_reaction_ko_matrix`). In the
+model:
+- a KO loss term penalises flux through knocked-out reactions; it is the
+  fifth entry of `loss_weight` / `loss_decay`, ordered
+  `[SV, negV, C, dropC, KO]`;
+- with `ko_embed_dim > 0`, the knockout vector is also embedded and given as
+  input to the flux and lag networks.
+
+Media files without `KO_` columns behave as before (no KO term).
+
+---
+
+## 5. Critical Internal Convention
+
+Regardless of dataset:
 
     BIOMASS MUST BE THE LAST METABOLITE.
 
@@ -139,14 +122,14 @@ Violating this ordering will break training and simulation.
 
 ---
 
-## 7. Using dAMN
+## 6. Using dAMN
 
-### 7.1 Environment Setup
+### 6.1 Environment Setup
 
-    conda env create -f environment.yaml
-    conda activate damn-env
+    conda env create -f environment.yml
+    conda activate dAMN_env
 
-### 7.2 Running the Model
+### 6.2 Running the Model
 
 Place all dataset files in the `data/` directory.
 
@@ -158,39 +141,36 @@ Open the notebook `dAMN.ipynb` to:
 - visualise trajectories and diagnostics  
 - export figures to the `figure/` directory  
 
-### 7.3 Parameter Search
+Training/test splits (`train_test_split`):
+- `medium`: split by media (`x_fold` sets the test fraction 1/x_fold);
+- `forecast`: train on the first time points of every medium, predict the rest;
+- `measure-<id>`: hold out one measured variable from the concentration loss
+  (e.g. `measure-ac_e`), with optional bounds `UB_in` / `UB_out` on its
+  consumption and production per time step.
 
-To run a parameter or hyperparameter search:
+### 6.3 Parameter Search
+
+To run a search over the loss weights and decays:
 
     python dAMN_parameter_search.py
 
-Outputs are saved in:
+Outputs are saved in `model/` and `figure/`.
 
-- `model/` for single-run results  
-- `model_xfold/` for cross-validation or repeated trainings  
-- `figure/` for all generated plots  
+### 6.4 dFBA Baseline and Benchmarks
 
----
-
-## 8. Comparison of Dataset Types
-
-| Feature                      | OD-Based Format         | Concentration-Based Format      |
-|-----------------------------|--------------------------|---------------------------------|
-| Input values                | OD measurements          | Metabolite concentrations       |
-| Observed metabolites        | BIOMASS only             | One or more metabolites         |
-| BIOMASS column              | Computed internally      | Required, must be last column   |
-| Multiple experiments        | Via experiment ID        | One file or structured tables   |
-| OD → biomass mapping        | Required                 | Not applicable                  |
+`dFBA.ipynb` runs a classical dFBA (`dFBA.py`) on the M28 dataset.
+`benchmarks/` compares dAMN with dFBA and a pure MLP on the M28 media splits
+and on acetate overflow (Millard data); see `benchmarks/README.md`.
 
 ---
 
-## 9. Contributors
+## 7. Contributors
 
 - Jean-Loup Faulon (INRAE) — Conceptualization, methodology, core model design, implementation, dataset integration, training pipeline  
 - Danilo Dursoniah (INRAE) — Testing and maintenance
 
 ---
 
-## 10. License
+## 8. License
 
 This project is distributed under the terms of the `LICENSE` file.
