@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """
-Figure 3b as a PowerPoint slide: acetate predicted by dFBA, MLP and dAMN on
-the Millard data (models trained on glucose and biomass only), in the style of
-Fig3.pptx (10 x 5.625 in, Arial 11 pt, same model colours). Curves and data
+The acetate panel as a PowerPoint slide: acetate predicted by dFBA, MLP and dAMN on
+the Millard data (models trained on glucose and biomass only), 10 x 5.625 in,
+Arial 11 pt. Curves and data
 are a native (editable) XY chart; the +-1 sd bands of MLP and dAMN are
 semi-transparent shapes drawn behind it, at positions computed from the chart's
 fixed plot area and axis ranges, and grouped with it. The method text is in
 the slide notes.
 
-Reads results/millard/figure_3b_curves.csv (figure_3b_data.py).
+Reads results/millard/acetate_panel_curves.csv (acetate_panel_data.py).
 
 Usage:
-    python figure_3b_pptx.py <output .pptx>
+    python acetate_panel_pptx.py <output .pptx>
 """
 
 import sys
@@ -31,13 +31,13 @@ FONT = 'Arial'
 TEXT = RGBColor(0x33, 0x33, 0x33)
 MUTED = RGBColor(0x6B, 0x6B, 0x6B)
 GRID = RGBColor(0xE3, 0xE2, 0xDE)
-COLORS = {  # Fig3.pptx series colours
+COLORS = {  # series colours
     'dFBA': RGBColor(0xF5, 0xA9, 0x8A),
     'MLP': RGBColor(0x86, 0xB6, 0xEF),
     'dAMN': RGBColor(0x7F, 0xD3, 0xB2),
 }
 NOTES = '\n'.join([
-    'Figure 3b. Prediction of acetate overflow in E. coli. Data: Millard et al. (2021), '
+    'Prediction of acetate overflow in E. coli. Data: Millard et al. (2021), '
     'strain MG1655 in M9 with 12.7 mM glucose and 0.96 mM acetate at t = 0, 13 time points '
     'over 4.6 h. The three models were trained or fitted on the glucose and biomass time '
     'series only; acetate measurements were never used, except its initial concentration '
@@ -165,7 +165,7 @@ def add_panel(shapes, tab, var, title, ytitle, x, y, w, h, y_max, bands=()):
     for t, v in zip(tab['time'], tab[f'measured_{var}']):
         s.add_data_point(t, v)
     gf = shapes.add_chart(XL_CHART_TYPE.XY_SCATTER_LINES_NO_MARKERS, *frame, data)
-    gf.name = f'Figure 3b {title}'
+    gf.name = f'Acetate panel {title}'
     chart = gf.chart
     chart.has_legend = False
     chart.has_title = True
@@ -227,16 +227,16 @@ def add_legend(slide, x, y, labels=None):
 
 def main():
     out = sys.argv[1]
-    tab = pd.read_csv('results/millard/figure_3b_curves.csv')
+    tab = pd.read_csv('results/millard/acetate_panel_curves.csv')
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(10), Inches(5.625)
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-    sc = pd.read_csv('results/millard/figure_3b_scores.csv').set_index('model')['R2_ac_e']
+    sc = pd.read_csv('results/millard/acetate_panel_scores.csv').set_index('model')['R2_ac_e']
     r2 = lambda m: 'R² < 0' if sc[m] < 0 else f'R² = {sc[m]:.2f}'
     add_legend(slide, 1.55, 0.2, {m: f'{m} ({r2(m)})' for m in ('dFBA', 'MLP', 'dAMN')})
     var, title, ytitle = PANELS[2]  # acetate only
     group = slide.shapes.add_group_shape()
-    group.name = 'Figure 3b acetate'
+    group.name = 'Acetate panel'
     add_panel(group.shapes, tab, var, title, ytitle, 2.0, 0.6, 6.0, 4.2, y_max=6,
               bands=('MLP', 'dAMN'))
     add_text(slide,

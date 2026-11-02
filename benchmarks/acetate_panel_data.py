@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Curves for Figure 3b (Millard data, acetate overflow): dFBA, MLP and dAMN on
+Curves of the acetate panel (Millard data, acetate overflow): dFBA, MLP and dAMN on
 glucose, biomass (training fits) and acetate (prediction, never trained on).
 
 dFBA  textbook dFBA of millard_acetate.py with Vmax_glc = 8 and O2 max = 15
@@ -11,11 +11,11 @@ dFBA  textbook dFBA of millard_acetate.py with Vmax_glc = 8 and O2 max = 15
       best case among them (acetate R2 0.73).
 MLP, dAMN  read from results/millard/millard_curves.csv (millard_acetate.py).
 
-Writes results/millard/figure_3b_curves.csv and figure_3b_scores.csv.
+Writes results/millard/acetate_panel_curves.csv and acetate_panel_scores.csv.
 
 Usage:
     python millard_acetate.py      # once, for millard_curves.csv
-    python figure_3b_data.py
+    python acetate_panel_data.py
 """
 
 import os
@@ -49,9 +49,9 @@ def main():
     for name in ('dFBA', 'MLP', 'dAMN'):
         pred = tab[[f'{name}_{v}' for v in m.VARS]].to_numpy()
         rows.append(dict(model=name, **{k: round(x, 3) for k, x in m.scores(pred, Y).items()}))
-    tab.to_csv(f'{m.OUT_DIR}/figure_3b_curves.csv', index=False)
+    tab.to_csv(f'{m.OUT_DIR}/acetate_panel_curves.csv', index=False)
     sc = pd.DataFrame(rows)
-    sc.to_csv(f'{m.OUT_DIR}/figure_3b_scores.csv', index=False)
+    sc.to_csv(f'{m.OUT_DIR}/acetate_panel_scores.csv', index=False)
     print(sc.to_string(index=False))
 
 

@@ -15,8 +15,8 @@ predicted (only its initial concentration is given).
 | Script | What it does |
 |---|---|
 | `millard_acetate.py` | Textbook dFBA, MLP control and dAMN; three-panel figure and scores |
-| `figure_3b_data.py` | Curves and scores of the acetate panel (dFBA with Vmax,glc = 8, O2max = 15) |
-| `figure_3b_pptx.py` | The acetate panel as an editable PowerPoint slide, methods in the notes |
+| `acetate_panel_data.py` | Curves and scores of the acetate panel (dFBA with Vmax,glc = 8, O2max = 15) |
+| `acetate_panel_pptx.py` | The acetate panel as an editable PowerPoint slide, methods in the notes |
 | `damn_millard_rerun.py` | Re-runs dAMN on this experiment and compares with the published curve |
 
 **dFBA**: standard dynamic FBA, static optimisation approach (Varma & Palsson
@@ -68,5 +68,5 @@ Metal plugin stops training early).
 
 ## 3. Requirements
 
-The dAMN environment (`../environment.yml`); `figure_3b_pptx.py` also needs
+The dAMN environment (`../environment.yml`); `acetate_panel_pptx.py` also needs
 `python-pptx`.
